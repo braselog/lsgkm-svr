@@ -69,7 +69,29 @@ help:
 	@echo "  make CUDA_ENABLED=0    - Build without CUDA support"
 	@echo "  make CUDA_PATH=/path   - Specify CUDA installation path"
 	@echo "  make CUDA_ARCH=sm_XX   - Specify CUDA architecture (e.g., sm_60, sm_70, sm_80)"
+	@echo "  make DEBUG=1           - Build with debug symbols and verbose output"
 	@echo "  make clean             - Clean build artifacts"
 	@echo "  make install           - Install binaries"
+	@echo ""
+	@echo "GPU Memory Management Features:"
+	@echo "  The enhanced version includes adaptive batch sizing and memory monitoring"
+	@echo "  Use --gpu-diag, --gpu-tune, and --gpu-reserve options for optimization"
 
-.PHONY: all clean install help
+# Debug build option
+ifeq ($(DEBUG), 1)
+    CFLAGS += -g -DDEBUG
+    CUDA_CFLAGS += -g -G -DDEBUG
+    $(info Building debug version with verbose GPU diagnostics)
+endif
+
+# Test target for GPU features
+test-gpu: gkmtrain
+	@echo "Testing GPU memory management features..."
+	@if [ -f gkmtrain ]; then \
+		echo "Running GPU diagnostics test..."; \
+		./gkmtrain --gpu-diag --help > /dev/null 2>&1 && echo "✓ GPU diagnostics available" || echo "✗ GPU diagnostics not available"; \
+	else \
+		echo "✗ gkmtrain not built"; \
+	fi
+
+.PHONY: all clean install help test-gpu

@@ -259,13 +259,13 @@ static void rbf_kernel_batch_parallel(const gkm_data *da, const gkm_data **db_ar
     // Detailed logging about optimization modes
     const char* simd_mode = get_simd_mode_string();
     
-    if (num_threads > 1) {
-        clog_info(CLOG(LOGGER_ID), "RBF batch computation: %d samples with %d threads using %s SIMD mode", 
-                  n, num_threads, simd_mode);
-    } else {
-        clog_info(CLOG(LOGGER_ID), "RBF batch computation: %d samples single-threaded using %s SIMD mode", 
-                  n, simd_mode);
-    }
+    // if (num_threads > 1) {
+    //     clog_info(CLOG(LOGGER_ID), "RBF batch computation: %d samples with %d threads using %s SIMD mode", 
+    //               n, num_threads, simd_mode);
+    // } else {
+    //     clog_info(CLOG(LOGGER_ID), "RBF batch computation: %d samples single-threaded using %s SIMD mode", 
+    //               n, simd_mode);
+    // }
     
     clog_debug(CLOG(LOGGER_ID), "RBF batch kernel: n=%d, threads=%d, normalize=%d, SIMD=%d", 
                n, num_threads, normalize, SIMD_AVAILABLE);
@@ -414,7 +414,7 @@ static void cleanup_gpu_acceleration(void) {
     }
 }
 
-// GPU-accelerated RBF kernel batch computation
+// Enhanced GPU-accelerated RBF kernel batch computation
 static void rbf_kernel_batch_gpu(const gkm_data *da, const gkm_data **db_array,
                                 int n, double gamma, double *results, int normalize) {
     if (!g_cuda_enabled || n < g_cuda_min_batch_size) {
@@ -425,15 +425,21 @@ static void rbf_kernel_batch_gpu(const gkm_data *da, const gkm_data **db_array,
     
     clog_debug(CLOG(LOGGER_ID), "Using GPU for RBF batch computation: n=%d, normalize=%d", n, normalize);
     
-    int result = cuda_rbf_kernel_batch(&g_cuda_context, da, db_array, n, gamma, results, normalize);
+    int processed = cuda_rbf_kernel_batch(&g_cuda_context, da, db_array, n, gamma, results, normalize);
     
-    if (result != 0) {
+    if (processed < 0) {
         clog_warn(CLOG(LOGGER_ID), "GPU computation failed, falling back to CPU");
         rbf_kernel_batch_parallel(da, db_array, n, gamma, results, normalize);
+    } else if (processed < n) {
+        // GPU processed only part of the batch due to memory constraints
+        clog_info(CLOG(LOGGER_ID), "GPU processed %d/%d samples, continuing with remaining %d on CPU", 
+                  processed, n, n - processed);
+        rbf_kernel_batch_parallel(da, db_array + processed, n - processed, gamma, 
+                                results + processed, normalize);
     }
 }
 
-// Adaptive batch processing with GPU/CPU hybrid approach
+// Enhanced adaptive batch processing with real-time memory monitoring
 static void rbf_kernel_batch_adaptive(const gkm_data *da, const gkm_data **db_array,
                                      int n, double gamma, double *results, int normalize) {
     if (!g_cuda_enabled) {
@@ -441,34 +447,100 @@ static void rbf_kernel_batch_adaptive(const gkm_data *da, const gkm_data **db_ar
         return;
     }
     
-    int max_gpu_batch = g_cuda_context.max_batch_size;
+    // Check GPU memory pressure before deciding on processing strategy
+    int pressure_level = cuda_memory_pressure_check(&g_cuda_context);
     
-    if (n <= max_gpu_batch && n >= g_cuda_min_batch_size) {
-        // Use GPU for entire batch
+    if (pressure_level >= 3) {
+        clog_warn(CLOG(LOGGER_ID), "Critical GPU memory pressure detected, using CPU");
+        rbf_kernel_batch_parallel(da, db_array, n, gamma, results, normalize);
+        return;
+    }
+    
+    // Get optimal batch size for current conditions
+    int optimal_batch = cuda_adaptive_batch_size(&g_cuda_context, da->num_covariates, n);
+    
+    if (optimal_batch <= 0 || optimal_batch < g_cuda_min_batch_size) {
+        clog_info(CLOG(LOGGER_ID), "Batch too small for GPU efficiency (%d < %d), using CPU", 
+                  optimal_batch, g_cuda_min_batch_size);
+        rbf_kernel_batch_parallel(da, db_array, n, gamma, results, normalize);
+        return;
+    }
+    
+    if (n <= optimal_batch) {
+        // Process entire batch on GPU
         rbf_kernel_batch_gpu(da, db_array, n, gamma, results, normalize);
-    } else if (n > max_gpu_batch) {
-        // Split into GPU-sized chunks
-        clog_info(CLOG(LOGGER_ID), "Large batch (%d), processing in GPU chunks of %d", n, max_gpu_batch);
+    } else {
+        // Process in adaptive chunks
+        clog_info(CLOG(LOGGER_ID), "Large batch (%d), processing in adaptive chunks (optimal: %d)", 
+                  n, optimal_batch);
         
         int processed = 0;
+        int retry_count = 0;
+        
         while (processed < n) {
-            int chunk_size = (n - processed > max_gpu_batch) ? max_gpu_batch : (n - processed);
+            int remaining = n - processed;
+            int chunk_size = (remaining > optimal_batch) ? optimal_batch : remaining;
             
-            if (chunk_size >= g_cuda_min_batch_size) {
-                // Use GPU for this chunk
-                rbf_kernel_batch_gpu(da, db_array + processed, chunk_size, gamma,
-                                   results + processed, normalize);
-            } else {
-                // Use CPU for small remaining chunk
-                rbf_kernel_batch_parallel(da, db_array + processed, chunk_size, gamma,
-                                        results + processed, normalize);
+            // Adaptive chunk sizing based on memory pressure
+            if (retry_count > 0) {
+                // Previous chunk may have failed, reduce size
+                chunk_size = chunk_size / 2;
+                if (chunk_size < g_cuda_min_batch_size) {
+                    // Switch to CPU for remaining
+                    clog_info(CLOG(LOGGER_ID), "Switching to CPU for remaining %d samples", remaining);
+                    rbf_kernel_batch_parallel(da, db_array + processed, remaining, gamma,
+                                            results + processed, normalize);
+                    break;
+                }
+                clog_info(CLOG(LOGGER_ID), "Retrying with reduced chunk size: %d", chunk_size);
             }
             
-            processed += chunk_size;
+            // Try GPU processing for this chunk
+            int gpu_processed = cuda_rbf_kernel_batch(&g_cuda_context, da, db_array + processed, 
+                                                     chunk_size, gamma, results + processed, normalize);
+            
+            if (gpu_processed > 0) {
+                // Success - update counters
+                processed += gpu_processed;
+                retry_count = 0;
+                
+                // If we processed less than requested, continue with next chunk
+                if (gpu_processed < chunk_size) {
+                    // GPU memory pressure caused partial processing
+                    optimal_batch = gpu_processed; // Reduce future chunk sizes
+                }
+            } else {
+                // GPU failed - try CPU for this chunk
+                if (chunk_size >= g_cuda_min_batch_size) {
+                    clog_warn(CLOG(LOGGER_ID), "GPU chunk failed, falling back to CPU for %d samples", chunk_size);
+                    rbf_kernel_batch_parallel(da, db_array + processed, chunk_size, gamma,
+                                            results + processed, normalize);
+                    processed += chunk_size;
+                    retry_count = 0;
+                } else {
+                    retry_count++;
+                    if (retry_count >= CUDA_MAX_MEMORY_PRESSURE_RETRIES) {
+                        clog_warn(CLOG(LOGGER_ID), "Too many GPU failures, switching to CPU for remaining samples");
+                        rbf_kernel_batch_parallel(da, db_array + processed, remaining, gamma,
+                                                results + processed, normalize);
+                        break;
+                    }
+                }
+            }
+            
+            // Check for memory pressure after each chunk
+            pressure_level = cuda_memory_pressure_check(&g_cuda_context);
+            if (pressure_level >= 2) {
+                // High pressure - reduce optimal batch size for next iteration
+                optimal_batch = optimal_batch * 3 / 4; // Reduce by 25%
+                if (optimal_batch < g_cuda_min_batch_size) {
+                    clog_info(CLOG(LOGGER_ID), "Memory pressure too high, switching to CPU for remaining samples");
+                    rbf_kernel_batch_parallel(da, db_array + processed, n - processed, gamma,
+                                            results + processed, normalize);
+                    break;
+                }
+            }
         }
-    } else {
-        // Batch too small for GPU efficiency, use CPU
-        rbf_kernel_batch_parallel(da, db_array, n, gamma, results, normalize);
     }
 }
 
@@ -1250,7 +1322,8 @@ static void kmertree_dfs_withhypexplanation(const KmerTree *tree,
                     kmertree_dfs_withhypexplanation(tree, last_seqid, depth+1,
                      daughter_node_index, next_matching_bases,
                      next_num_matching_bases, mmprof,
-                     persv_explanation);
+                     persv_explanation, tree_lmer,
+                     one_mismatch_deeper, perturbation_eff);
                 } 
             }
         }
@@ -1415,7 +1488,8 @@ static void kmertree_dfs_explainsinglebase(
                     kmertree_dfs_explainsinglebase(tree, last_seqid, depth+1,
                      daughter_node_index, next_matching_bases,
                      next_num_matching_bases, mmprof,
-                     persv_explanation);
+                     tree_lmer, pos_to_explain, base_at_pos_to_explain,
+                     singlebase_mmprof);
                 } 
             }
         }
@@ -2830,6 +2904,8 @@ double* gkmkernel_kernelfunc_batch(const gkm_data *da, const union svm_data *db_
     if (g_param->kernel_type == EST_TRUNC_RBF || g_param->kernel_type == EST_TRUNC_PW_RBF) {
         for (i=0; i<n; i++) {
             res[i] = exp(g_param->gamma*(res[i]-1));
+        }
+    }
 
     gettimeofday(&time_end, NULL);
     clog_trace(CLOG(LOGGER_ID), "DFS n=%d (%ld ms)", n, diff_ms(time_end, time_start));
@@ -2919,7 +2995,7 @@ double* gkmexplainsinglebasekernel_kernelfunc_batch_sv(
         return NULL;
     }
 
-    int h,j;
+    int h,j,k;
     struct timeval time_start, time_end;
 
     gettimeofday(&time_start, NULL);
@@ -3717,7 +3793,7 @@ void gkmkernel_mkl_optimize_weights(const struct svm_problem *prob, struct svm_p
             // Update progress
             completed += n;
             double percent = (completed * 100.0) / total_pairs;
-            if ((percent - last_percent >= 1.0) || (percent == 100.0)) {
+            if ((percent - last_percent >= 0.5) || (percent == 100.0)) {
                 clog_info(CLOG(LOGGER_ID), "Kernel matrix computation: %.1f%% complete (%d/%d)", 
                          percent, completed, total_pairs);
                 last_percent = percent;

@@ -22,8 +22,19 @@
 #include <string.h>
 #include <ctype.h>
 #include <errno.h>
+#include <getopt.h>
 
 #include "libsvm_gkm.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include "rbf_cuda.h"
+
+#ifdef __cplusplus
+}
+#endif
 
 #define CLOG_MAIN
 #include "clog.h"
@@ -97,6 +108,11 @@ void print_usage_and_exit()
             "                4 -- progress msgs at finer-grained level (TRACE)\n"
             "-T <1|4|16>   set the number of threads for parallel calculation, 1, 4, or 16\n"
             "                 (default: 1)\n"
+            "\n"
+            "GPU Memory Management Options:\n"
+            " --gpu-diag    print detailed GPU memory diagnostics and optimization stats\n"
+            " --gpu-tune    perform auto-tuning of batch sizes before training\n" 
+            " --gpu-reserve <MB>  reserve GPU memory for other operations (default: 0)\n"
             "\n");
 
 	exit(0);
@@ -150,6 +166,11 @@ int main(int argc, char** argv)
 	int rseed = 1;
     int tmpM;
     char *covariate_file = NULL;
+    
+    // GPU memory management options
+    int gpu_diagnostics = 0;
+    int gpu_auto_tune = 0;
+    int gpu_reserve_mb = 0;
 
     /* Initialize the logger */
     if (clog_init_fd(LOGGER_ID, 1) != 0) {
@@ -190,8 +211,18 @@ int main(int argc, char** argv)
     cross_validation = 0;
     icv = 0;
 
+    // Long options for GPU management
+    static struct option long_options[] = {
+        {"gpu-diag", no_argument, 0, 1000},
+        {"gpu-tune", no_argument, 0, 1001},
+        {"gpu-reserve", required_argument, 0, 1002},
+        {0, 0, 0, 0}
+    };
+
 	int c;
-	while ((c = getopt (argc, argv, "y:t:l:k:d:g:G:M:H:W:R:I:E:c:e:p:w:m:x:i:r:sv:T:N")) != -1) {
+	int option_index = 0;
+	while ((c = getopt_long(argc, argv, "y:t:l:k:d:g:G:M:H:W:R:I:E:c:e:p:w:m:x:i:r:sv:T:N", 
+                           long_options, &option_index)) != -1) {
 		switch (c) {
             case 'y':
                 param.svm_type = atoi(optarg);
@@ -280,8 +311,21 @@ int main(int argc, char** argv)
             case 'T':
                 nthreads = atoi(optarg);
                 break;
+            case 1000:  // --gpu-diag
+                gpu_diagnostics = 1;
+                break;
+            case 1001:  // --gpu-tune
+                gpu_auto_tune = 1;
+                break;
+            case 1002:  // --gpu-reserve
+                gpu_reserve_mb = atoi(optarg);
+                break;
 			default:
-                fprintf(stderr,"Unknown option: -%c\n", c);
+                if (c != 0) {
+                    fprintf(stderr,"Unknown option: -%c\n", c);
+                } else {
+                    fprintf(stderr,"Unknown option: %s\n", long_options[option_index].name);
+                }
                 print_usage_and_exit();
 		}
 	}
@@ -373,6 +417,46 @@ int main(int argc, char** argv)
     } 
 
     gkmkernel_init(&param);
+
+    // GPU memory management and diagnostics
+    if (gpu_reserve_mb > 0) {
+        extern cuda_context_t g_cuda_context;
+        if (g_cuda_context.is_initialized) {
+            size_t reserve_bytes = (size_t)gpu_reserve_mb * 1024 * 1024;
+            cuda_reserve_memory(&g_cuda_context, reserve_bytes);
+            clog_info(CLOG(LOGGER_ID), "Reserved %d MB of GPU memory for other operations", gpu_reserve_mb);
+        }
+    }
+    
+    if (gpu_diagnostics) {
+        extern cuda_context_t g_cuda_context;
+        if (g_cuda_context.is_initialized) {
+            clog_info(CLOG(LOGGER_ID), "=== GPU Memory Diagnostics ===");
+            cuda_memory_diagnostics(&g_cuda_context);
+            cuda_print_optimization_stats(&g_cuda_context);
+        } else {
+            clog_warn(CLOG(LOGGER_ID), "GPU not initialized - cannot show diagnostics");
+        }
+    }
+    
+    if (gpu_auto_tune) {
+        extern cuda_context_t g_cuda_context;
+        if (g_cuda_context.is_initialized) {
+            clog_info(CLOG(LOGGER_ID), "Performing GPU batch size auto-tuning...");
+            // Use typical covariate count for tuning (estimate based on L and k)
+            int est_covariates = (param.L - param.k + 1) * (1 << (2 * param.k));
+            if (est_covariates > 100000) est_covariates = 100000; // Cap at reasonable value
+            
+            int optimal_batch = cuda_auto_tune_batch_size(&g_cuda_context, est_covariates, 1000, 50000);
+            if (optimal_batch > 0) {
+                clog_info(CLOG(LOGGER_ID), "Auto-tuning completed. Optimal batch size: %d", optimal_batch);
+            } else {
+                clog_warn(CLOG(LOGGER_ID), "Auto-tuning failed");
+            }
+        } else {
+            clog_warn(CLOG(LOGGER_ID), "GPU not initialized - cannot perform auto-tuning");
+        }
+    }
 
     max_line_len = 1024;
     line = (char *) malloc(sizeof(char) * ((size_t) max_line_len));
