@@ -27,6 +27,17 @@
 #include <sys/time.h>
 #include <locale.h>
 
+// SIMD optimizations
+#ifdef __AVX2__
+#include <immintrin.h>
+#define SIMD_AVAILABLE 1
+#elif defined(__SSE2__)
+#include <emmintrin.h>
+#define SIMD_AVAILABLE 1
+#else
+#define SIMD_AVAILABLE 0
+#endif
+
 #include "libsvm_gkm.h"
 #include "clog.h"
 
@@ -91,6 +102,225 @@ static double rbf_kernel_normalize(const gkm_data *da, const gkm_data *db, doubl
         return cross / sqrt(self_a * self_b);
     }
     return 0.0;
+}
+
+/* Optimized RBF kernel implementations */
+
+// SIMD capability detection and reporting
+static const char* get_simd_mode_string(void) {
+#if SIMD_AVAILABLE && defined(__AVX2__)
+    return "AVX2";
+#elif SIMD_AVAILABLE && defined(__SSE2__)
+    return "SSE2";
+#else
+    return "scalar";
+#endif
+}
+
+// Fast exponential approximation for better performance
+static inline double fast_exp(double x) {
+    // Use built-in exp for now, but could be replaced with faster approximation
+    // if needed (e.g., using polynomial approximation)
+    return exp(x);
+}
+
+// SIMD-optimized squared distance calculation
+static inline double simd_squared_distance(const double *a, const double *b, int n) {
+#if SIMD_AVAILABLE && defined(__AVX2__)
+    if (n >= 4) {
+        __m256d sum_vec = _mm256_setzero_pd();
+        int i;
+        
+        // Process 4 doubles at a time with AVX2
+        for (i = 0; i <= n - 4; i += 4) {
+            __m256d va = _mm256_loadu_pd(&a[i]);
+            __m256d vb = _mm256_loadu_pd(&b[i]);
+            __m256d diff = _mm256_sub_pd(va, vb);
+            __m256d squared = _mm256_mul_pd(diff, diff);
+            sum_vec = _mm256_add_pd(sum_vec, squared);
+        }
+        
+        // Sum the 4 values in sum_vec
+        double result[4];
+        _mm256_storeu_pd(result, sum_vec);
+        double sum = result[0] + result[1] + result[2] + result[3];
+        
+        // Handle remaining elements
+        for (; i < n; i++) {
+            double diff = a[i] - b[i];
+            sum += diff * diff;
+        }
+        
+        return sum;
+    }
+#elif SIMD_AVAILABLE && defined(__SSE2__)
+    if (n >= 2) {
+        __m128d sum_vec = _mm_setzero_pd();
+        int i;
+        
+        // Process 2 doubles at a time with SSE2
+        for (i = 0; i <= n - 2; i += 2) {
+            __m128d va = _mm_loadu_pd(&a[i]);
+            __m128d vb = _mm_loadu_pd(&b[i]);
+            __m128d diff = _mm_sub_pd(va, vb);
+            __m128d squared = _mm_mul_pd(diff, diff);
+            sum_vec = _mm_add_pd(sum_vec, squared);
+        }
+        
+        // Sum the 2 values in sum_vec
+        double result[2];
+        _mm_storeu_pd(result, sum_vec);
+        double sum = result[0] + result[1];
+        
+        // Handle remaining elements
+        for (; i < n; i++) {
+            double diff = a[i] - b[i];
+            sum += diff * diff;
+        }
+        
+        return sum;
+    }
+#endif
+    
+    // Fallback to scalar implementation
+    double sum = 0.0;
+    for (int i = 0; i < n; i++) {
+        double diff = a[i] - b[i];
+        sum += diff * diff;
+    }
+    return sum;
+}
+
+// Optimized RBF kernel with SIMD
+static double rbf_kernel_optimized(const gkm_data *da, const gkm_data *db, double gamma) {
+    if (da->num_covariates != db->num_covariates) {
+        clog_error(CLOG(LOGGER_ID), "mismatched number of covariates: %d vs %d", 
+                   da->num_covariates, db->num_covariates);
+        return 0.0;
+    }
+    
+    if (da->num_covariates == 0) return 1.0;
+    
+    double sum = simd_squared_distance(da->covariates, db->covariates, da->num_covariates);
+    return fast_exp(-gamma * sum);
+}
+
+// Thread data structure for parallel RBF computation
+typedef struct _rbf_pthread_t {
+    const gkm_data *da;
+    const gkm_data **db_array;
+    double gamma;
+    int start_idx;
+    int end_idx;
+    double *results;
+    int normalize;
+    double *self_cache;
+} rbf_pthread_t;
+
+// Worker function for parallel RBF computation
+static void *rbf_kernel_pthread(void *ptr) {
+    rbf_pthread_t *td = (rbf_pthread_t *) ptr;
+    
+    for (int i = td->start_idx; i < td->end_idx; i++) {
+        if (td->normalize) {
+            // Cached self-kernel values
+            double self_a = td->self_cache[0];  // da self-kernel
+            double self_b = td->self_cache[i + 1];  // db[i] self-kernel
+            double cross = rbf_kernel_optimized(td->da, td->db_array[i], td->gamma);
+            
+            if (self_a * self_b > 0) {
+                td->results[i] = cross / sqrt(self_a * self_b);
+            } else {
+                td->results[i] = 0.0;
+            }
+        } else {
+            td->results[i] = rbf_kernel_optimized(td->da, td->db_array[i], td->gamma);
+        }
+    }
+    
+    return NULL;
+}
+
+// Parallel batch RBF kernel computation
+static void rbf_kernel_batch_parallel(const gkm_data *da, const gkm_data **db_array, 
+                                     int n, double gamma, double *results, int normalize) {
+    if (n <= 0) return;
+    
+    int num_threads = (g_param_nthreads > 1) ? g_param_nthreads : 1;
+    if (num_threads > n) num_threads = n;
+    
+    // Detailed logging about optimization modes
+    const char* simd_mode = get_simd_mode_string();
+    
+    if (num_threads > 1) {
+        clog_info(CLOG(LOGGER_ID), "RBF batch computation: %d samples with %d threads using %s SIMD mode", 
+                  n, num_threads, simd_mode);
+    } else {
+        clog_info(CLOG(LOGGER_ID), "RBF batch computation: %d samples single-threaded using %s SIMD mode", 
+                  n, simd_mode);
+    }
+    
+    clog_debug(CLOG(LOGGER_ID), "RBF batch kernel: n=%d, threads=%d, normalize=%d, SIMD=%d", 
+               n, num_threads, normalize, SIMD_AVAILABLE);
+    
+    // Prepare self-kernel cache if normalizing
+    double *self_cache = NULL;
+    if (normalize) {
+        self_cache = (double *) malloc(sizeof(double) * (n + 1));
+        self_cache[0] = rbf_kernel_optimized(da, da, gamma);  // da self-kernel
+        
+        // Compute self-kernels for all db entries
+        for (int i = 0; i < n; i++) {
+            self_cache[i + 1] = rbf_kernel_optimized(db_array[i], db_array[i], gamma);
+        }
+    }
+    
+    if (num_threads == 1) {
+        // Single-threaded execution
+        rbf_pthread_t td;
+        td.da = da;
+        td.db_array = db_array;
+        td.gamma = gamma;
+        td.start_idx = 0;
+        td.end_idx = n;
+        td.results = results;
+        td.normalize = normalize;
+        td.self_cache = self_cache;
+        
+        rbf_kernel_pthread(&td);
+    } else {
+        // Multi-threaded execution
+        pthread_t threads[16];  // Max threads
+        rbf_pthread_t td[16];
+        int chunk_size = n / num_threads;
+        
+        for (int t = 0; t < num_threads; t++) {
+            td[t].da = da;
+            td[t].db_array = db_array;
+            td[t].gamma = gamma;
+            td[t].start_idx = t * chunk_size;
+            td[t].end_idx = (t == num_threads - 1) ? n : (t + 1) * chunk_size;
+            td[t].results = results;
+            td[t].normalize = normalize;
+            td[t].self_cache = self_cache;
+            
+            int rc = pthread_create(&threads[t], NULL, rbf_kernel_pthread, &td[t]);
+            if (rc != 0) {
+                clog_error(CLOG(LOGGER_ID), "failed to create RBF thread %d", t);
+                // Fall back to single-threaded execution for this thread
+                rbf_kernel_pthread(&td[t]);
+            }
+        }
+        
+        // Wait for all threads to complete
+        for (int t = 0; t < num_threads; t++) {
+            pthread_join(threads[t], NULL);
+        }
+    }
+    
+    if (self_cache) {
+        free(self_cache);
+    }
 }
 
 typedef struct _BaseMismatchCount {
@@ -3134,7 +3364,7 @@ double gkmkernel_mkl_kernelfunc(const gkm_data *da, const gkm_data *db)
             if (g_param->normalize_kernels) {
                 rbf_val = rbf_kernel_normalize(da, db, g_param->rbf_gamma);
             } else {
-                rbf_val = rbf_kernel(da, db, g_param->rbf_gamma);
+                rbf_val = rbf_kernel_optimized(da, db, g_param->rbf_gamma);
             }
             return g_param->gkm_weight * gkm_val + g_param->rbf_weight * rbf_val;
             
@@ -3145,7 +3375,7 @@ double gkmkernel_mkl_kernelfunc(const gkm_data *da, const gkm_data *db)
             if (g_param->normalize_kernels) {
                 return rbf_kernel_normalize(da, db, g_param->rbf_gamma);
             } else {
-                return rbf_kernel(da, db, g_param->rbf_gamma);
+                return rbf_kernel_optimized(da, db, g_param->rbf_gamma);
             }
             
         default:
@@ -3159,6 +3389,7 @@ double* gkmkernel_mkl_kernelfunc_batch(const gkm_data *da, const union svm_data 
     int i;
     double *gkm_res = NULL;
     double *rbf_res = NULL;
+    const gkm_data **db_ptrs = NULL;
     
     switch (g_param->kernel_type) {
         case MKL_GKM_RBF:
@@ -3167,12 +3398,15 @@ double* gkmkernel_mkl_kernelfunc_batch(const gkm_data *da, const union svm_data 
             
             gkmkernel_kernelfunc_batch(da, db_array, n, gkm_res);
             
+            // Use optimized parallel RBF computation
+            db_ptrs = (const gkm_data **) malloc(sizeof(gkm_data *) * n);
             for (i = 0; i < n; i++) {
-                if (g_param->normalize_kernels) {
-                    rbf_res[i] = rbf_kernel_normalize(da, db_array[i].d, g_param->rbf_gamma);
-                } else {
-                    rbf_res[i] = rbf_kernel(da, db_array[i].d, g_param->rbf_gamma);
-                }
+                db_ptrs[i] = db_array[i].d;
+            }
+            rbf_kernel_batch_parallel(da, db_ptrs, n, g_param->rbf_gamma, rbf_res, g_param->normalize_kernels);
+            free(db_ptrs);
+            
+            for (i = 0; i < n; i++) {
                 res[i] = g_param->gkm_weight * gkm_res[i] + g_param->rbf_weight * rbf_res[i];
             }
             
@@ -3185,13 +3419,13 @@ double* gkmkernel_mkl_kernelfunc_batch(const gkm_data *da, const union svm_data 
             break;
             
         case MKL_RBF_ONLY:
+            // Use optimized parallel RBF computation
+            db_ptrs = (const gkm_data **) malloc(sizeof(gkm_data *) * n);
             for (i = 0; i < n; i++) {
-                if (g_param->normalize_kernels) {
-                    res[i] = rbf_kernel_normalize(da, db_array[i].d, g_param->rbf_gamma);
-                } else {
-                    res[i] = rbf_kernel(da, db_array[i].d, g_param->rbf_gamma);
-                }
+                db_ptrs[i] = db_array[i].d;
             }
+            rbf_kernel_batch_parallel(da, db_ptrs, n, g_param->rbf_gamma, res, g_param->normalize_kernels);
+            free(db_ptrs);
             break;
             
         default:
@@ -3211,6 +3445,7 @@ double* gkmkernel_mkl_kernelfunc_batch_all(const int a, const int start, const i
     const gkm_data *da = g_prob_svm_data[a].d;
     double *gkm_res = NULL;
     double *rbf_res = NULL;
+    const gkm_data **db_ptrs = NULL;
     
     switch (g_param->kernel_type) {
         case MKL_GKM_RBF:
@@ -3219,13 +3454,15 @@ double* gkmkernel_mkl_kernelfunc_batch_all(const int a, const int start, const i
             
             gkmkernel_kernelfunc_batch_all(a, start, end, gkm_res);
             
+            // Use optimized parallel RBF computation
+            db_ptrs = (const gkm_data **) malloc(sizeof(gkm_data *) * (end - start));
             for (j = 0; j < end - start; j++) {
-                const gkm_data *db = g_prob_svm_data[start + j].d;
-                if (g_param->normalize_kernels) {
-                    rbf_res[j] = rbf_kernel_normalize(da, db, g_param->rbf_gamma);
-                } else {
-                    rbf_res[j] = rbf_kernel(da, db, g_param->rbf_gamma);
-                }
+                db_ptrs[j] = g_prob_svm_data[start + j].d;
+            }
+            rbf_kernel_batch_parallel(da, db_ptrs, end - start, g_param->rbf_gamma, rbf_res, g_param->normalize_kernels);
+            free(db_ptrs);
+            
+            for (j = 0; j < end - start; j++) {
                 res[j] = g_param->gkm_weight * gkm_res[j] + g_param->rbf_weight * rbf_res[j];
             }
             
@@ -3238,14 +3475,13 @@ double* gkmkernel_mkl_kernelfunc_batch_all(const int a, const int start, const i
             break;
             
         case MKL_RBF_ONLY:
+            // Use optimized parallel RBF computation
+            db_ptrs = (const gkm_data **) malloc(sizeof(gkm_data *) * (end - start));
             for (j = 0; j < end - start; j++) {
-                const gkm_data *db = g_prob_svm_data[start + j].d;
-                if (g_param->normalize_kernels) {
-                    res[j] = rbf_kernel_normalize(da, db, g_param->rbf_gamma);
-                } else {
-                    res[j] = rbf_kernel(da, db, g_param->rbf_gamma);
-                }
+                db_ptrs[j] = g_prob_svm_data[start + j].d;
             }
+            rbf_kernel_batch_parallel(da, db_ptrs, end - start, g_param->rbf_gamma, res, g_param->normalize_kernels);
+            free(db_ptrs);
             break;
             
         default:
@@ -3264,6 +3500,7 @@ double* gkmkernel_mkl_kernelfunc_batch_sv(const gkm_data *d, double *res)
     int i;
     double *gkm_res = NULL;
     double *rbf_res = NULL;
+    const gkm_data **sv_ptrs = NULL;
     
     switch (g_param->kernel_type) {
         case MKL_GKM_RBF:
@@ -3272,12 +3509,15 @@ double* gkmkernel_mkl_kernelfunc_batch_sv(const gkm_data *d, double *res)
             
             gkmkernel_kernelfunc_batch_sv(d, gkm_res);
             
+            // Use optimized parallel RBF computation
+            sv_ptrs = (const gkm_data **) malloc(sizeof(gkm_data *) * g_sv_num);
             for (i = 0; i < g_sv_num; i++) {
-                if (g_param->normalize_kernels) {
-                    rbf_res[i] = rbf_kernel_normalize(d, g_sv_svm_data[i].d, g_param->rbf_gamma);
-                } else {
-                    rbf_res[i] = rbf_kernel(d, g_sv_svm_data[i].d, g_param->rbf_gamma);
-                }
+                sv_ptrs[i] = g_sv_svm_data[i].d;
+            }
+            rbf_kernel_batch_parallel(d, sv_ptrs, g_sv_num, g_param->rbf_gamma, rbf_res, g_param->normalize_kernels);
+            free(sv_ptrs);
+            
+            for (i = 0; i < g_sv_num; i++) {
                 res[i] = g_param->gkm_weight * gkm_res[i] + g_param->rbf_weight * rbf_res[i];
             }
             
@@ -3290,13 +3530,13 @@ double* gkmkernel_mkl_kernelfunc_batch_sv(const gkm_data *d, double *res)
             break;
             
         case MKL_RBF_ONLY:
+            // Use optimized parallel RBF computation
+            sv_ptrs = (const gkm_data **) malloc(sizeof(gkm_data *) * g_sv_num);
             for (i = 0; i < g_sv_num; i++) {
-                if (g_param->normalize_kernels) {
-                    res[i] = rbf_kernel_normalize(d, g_sv_svm_data[i].d, g_param->rbf_gamma);
-                } else {
-                    res[i] = rbf_kernel(d, g_sv_svm_data[i].d, g_param->rbf_gamma);
-                }
+                sv_ptrs[i] = g_sv_svm_data[i].d;
             }
+            rbf_kernel_batch_parallel(d, sv_ptrs, g_sv_num, g_param->rbf_gamma, res, g_param->normalize_kernels);
+            free(sv_ptrs);
             break;
             
         default:
@@ -3322,21 +3562,41 @@ void gkmkernel_mkl_optimize_weights(const struct svm_problem *prob, struct svm_p
     double *gkm_kernels = (double *) malloc(sizeof(double) * n * n);
     double *rbf_kernels = (double *) malloc(sizeof(double) * n * n);
     
+    // Report optimization capabilities at start of MKL computation
+    clog_info(CLOG(LOGGER_ID), "=== MKL RBF Optimization Configuration ===");
+    clog_info(CLOG(LOGGER_ID), "SIMD Mode: %s", get_simd_mode_string());
+    clog_info(CLOG(LOGGER_ID), "Threading: %s (%d threads)", 
+              g_param_nthreads > 1 ? "enabled" : "disabled", g_param_nthreads);
     clog_info(CLOG(LOGGER_ID), "Computing kernel matrices for MKL optimization...");
     
-    // Compute individual kernel matrices
+    // Compute individual kernel matrices with progress indication
+    int total_pairs = n * n;
+    int completed = 0;
+    double last_percent = -1.0;
+    
     for (i = 0; i < n; i++) {
         for (j = 0; j < n; j++) {
             int idx = i * n + j;
             
             // Compute GKM kernel
+            // clog_info(CLOG(LOGGER_ID), "Computing GKM kernel for pair (%d, %d)", i, j);
             gkm_kernels[idx] = gkmkernel_kernelfunc(prob->x[i].d, prob->x[j].d);
             
             // Compute RBF kernel
+            // clog_info(CLOG(LOGGER_ID), "Computing RBF kernel for pair (%d, %d)", i, j);
             if (param->normalize_kernels) {
                 rbf_kernels[idx] = rbf_kernel_normalize(prob->x[i].d, prob->x[j].d, param->rbf_gamma);
             } else {
                 rbf_kernels[idx] = rbf_kernel(prob->x[i].d, prob->x[j].d, param->rbf_gamma);
+            }
+            
+            // Update progress
+            completed++;
+            double percent = (completed * 100.0) / total_pairs;
+            if ((percent - last_percent >= 0.01) || (percent == 100.0)) {
+                clog_info(CLOG(LOGGER_ID), "Kernel matrix computation: %.2f%% complete (%d/%d)", 
+                         percent, completed, total_pairs);
+                last_percent = percent;
             }
         }
     }
