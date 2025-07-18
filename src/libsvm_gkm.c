@@ -41,6 +41,14 @@
 #include "libsvm_gkm.h"
 #include "clog.h"
 
+#ifdef USE_CUDA
+#include "rbf_cuda.h"
+// Global CUDA variables
+static cuda_context_t g_cuda_context = {0};
+static int g_cuda_enabled = 0;
+static int g_cuda_min_batch_size = CUDA_MIN_BATCH_SIZE;
+#endif
+
 #define MAX_MM 12
 
 //XXX: only works when MAX_ALPHABET_SIZE = 4
@@ -68,7 +76,6 @@ static union svm_data *g_sv_svm_data = NULL;
 static int g_sv_num = 0;
 
 static KmerTreeCoef *g_sv_kmertreecoef = NULL;
-
 static uint8_t *g_mmcnt_lookuptab = NULL;
 static int g_mmcnt_lookuptab_mask = 0;
 static int g_mmcnt_nlookups = 0;
@@ -376,7 +383,111 @@ static time_t diff_ms(struct timeval t1, struct timeval t2)
 {
     return (t1.tv_sec - t2.tv_sec)*1000 + (t1.tv_usec - t2.tv_usec)/1000;
 }
+#ifdef USE_CUDA
+// GPU acceleration utility functions
 
+// Initialize GPU acceleration
+static int init_gpu_acceleration(int max_batch_size, int max_covariates) {
+    if (!cuda_is_available()) {
+        clog_info(CLOG(LOGGER_ID), "CUDA not available, using CPU-only computation");
+        return 0;
+    }
+    
+    if (cuda_init_context(&g_cuda_context, max_batch_size, max_covariates) != 0) {
+        clog_warn(CLOG(LOGGER_ID), "Failed to initialize CUDA context, falling back to CPU");
+        g_cuda_enabled = 0;
+        return 0;
+    }
+    
+    g_cuda_enabled = 1;
+    clog_info(CLOG(LOGGER_ID), "GPU acceleration enabled for RBF kernel computation");
+    cuda_print_device_info();
+    return 1;
+}
+
+// Cleanup GPU acceleration
+static void cleanup_gpu_acceleration(void) {
+    if (g_cuda_enabled) {
+        cuda_cleanup_context(&g_cuda_context);
+        g_cuda_enabled = 0;
+        clog_info(CLOG(LOGGER_ID), "GPU acceleration cleaned up");
+    }
+}
+
+// GPU-accelerated RBF kernel batch computation
+static void rbf_kernel_batch_gpu(const gkm_data *da, const gkm_data **db_array,
+                                int n, double gamma, double *results, int normalize) {
+    if (!g_cuda_enabled || n < g_cuda_min_batch_size) {
+        // Fall back to CPU if GPU not enabled or batch too small
+        rbf_kernel_batch_parallel(da, db_array, n, gamma, results, normalize);
+        return;
+    }
+    
+    clog_debug(CLOG(LOGGER_ID), "Using GPU for RBF batch computation: n=%d, normalize=%d", n, normalize);
+    
+    int result = cuda_rbf_kernel_batch(&g_cuda_context, da, db_array, n, gamma, results, normalize);
+    
+    if (result != 0) {
+        clog_warn(CLOG(LOGGER_ID), "GPU computation failed, falling back to CPU");
+        rbf_kernel_batch_parallel(da, db_array, n, gamma, results, normalize);
+    }
+}
+
+// Adaptive batch processing with GPU/CPU hybrid approach
+static void rbf_kernel_batch_adaptive(const gkm_data *da, const gkm_data **db_array,
+                                     int n, double gamma, double *results, int normalize) {
+    if (!g_cuda_enabled) {
+        rbf_kernel_batch_parallel(da, db_array, n, gamma, results, normalize);
+        return;
+    }
+    
+    int max_gpu_batch = g_cuda_context.max_batch_size;
+    
+    if (n <= max_gpu_batch && n >= g_cuda_min_batch_size) {
+        // Use GPU for entire batch
+        rbf_kernel_batch_gpu(da, db_array, n, gamma, results, normalize);
+    } else if (n > max_gpu_batch) {
+        // Split into GPU-sized chunks
+        clog_info(CLOG(LOGGER_ID), "Large batch (%d), processing in GPU chunks of %d", n, max_gpu_batch);
+        
+        int processed = 0;
+        while (processed < n) {
+            int chunk_size = (n - processed > max_gpu_batch) ? max_gpu_batch : (n - processed);
+            
+            if (chunk_size >= g_cuda_min_batch_size) {
+                // Use GPU for this chunk
+                rbf_kernel_batch_gpu(da, db_array + processed, chunk_size, gamma,
+                                   results + processed, normalize);
+            } else {
+                // Use CPU for small remaining chunk
+                rbf_kernel_batch_parallel(da, db_array + processed, chunk_size, gamma,
+                                        results + processed, normalize);
+            }
+            
+            processed += chunk_size;
+        }
+    } else {
+        // Batch too small for GPU efficiency, use CPU
+        rbf_kernel_batch_parallel(da, db_array, n, gamma, results, normalize);
+    }
+}
+
+#else
+// No CUDA support - use CPU implementation
+static int init_gpu_acceleration(int max_batch_size, int max_covariates) {
+    clog_info(CLOG(LOGGER_ID), "Compiled without CUDA support, using CPU-only computation");
+    return 0;
+}
+
+static void cleanup_gpu_acceleration(void) {
+    // No-op when CUDA not available
+}
+
+static void rbf_kernel_batch_adaptive(const gkm_data *da, const gkm_data **db_array,
+                                     int n, double gamma, double *results, int normalize) {
+    rbf_kernel_batch_parallel(da, db_array, n, gamma, results, normalize);
+}
+#endif
 /********************************************
  * various weight calculations from gkmsvm  *
  ********************************************/
@@ -807,7 +918,7 @@ static void kmertree_dfs_withexplanation(const KmerTree *tree,
                                     // base_then will be the same as
                                     // currbase) 
                                     uint8_t base_then = *(curr_matching_bases[j].bid - ((L-1)-k));
-                                    //if the kth base in the lmer is a match, increment the contribution score at
+                                    //if the kth base in thelmer is a match, increment the contribution score at
                                     // that base. Note that we know from the control flow that the L-1th base
                                     // is a match.
                                     if ((currbase_base_lmer_match_history[k] == 1) || (k==L-1)) {
@@ -850,7 +961,7 @@ static void kmertree_dfs_withexplanation(const KmerTree *tree,
                                 int total_matches = 0;
                                 for (k=0; k<L; k++) {
                                     uint8_t base_then = *(curr_matching_bases[j].bid - ((L-1)-k));
-                                    //if the kth base in the lmer is a match, increment the contribution score at
+                                    //if the kth base in thelmer is a match, increment the contribution score at
                                     // that base. Note that we know from the control flow that the L-1th base
                                     // is a mismatch.
                                     if ((currbase_base_lmer_match_history[k] == 1) && (k<(L-1))) {
@@ -1139,8 +1250,7 @@ static void kmertree_dfs_withhypexplanation(const KmerTree *tree,
                     kmertree_dfs_withhypexplanation(tree, last_seqid, depth+1,
                      daughter_node_index, next_matching_bases,
                      next_num_matching_bases, mmprof,
-                     persv_explanation, tree_lmer,
-                     one_mismatch_deeper, perturbation_eff);
+                     persv_explanation);
                 } 
             }
         }
@@ -1304,9 +1414,8 @@ static void kmertree_dfs_explainsinglebase(
                 if (next_num_matching_bases > 0) {
                     kmertree_dfs_explainsinglebase(tree, last_seqid, depth+1,
                      daughter_node_index, next_matching_bases,
-                     next_num_matching_bases, mmprof, tree_lmer,
-                     pos_to_explain, base_at_pos_to_explain,
-                     singlebase_mmprof);
+                     next_num_matching_bases, mmprof,
+                     persv_explanation);
                 } 
             }
         }
@@ -2476,6 +2585,12 @@ void gkmkernel_init(struct svm_parameter *param)
     kmertree_init(g_kmertree, g_param->L);
 
     gkmkernel_build_mmcnt_lookuptable();
+    
+    // Initialize GPU acceleration if CUDA is available
+    gkmkernel_init_gpu_if_needed();
+    
+    // Initialize GPU acceleration if CUDA is available
+    gkmkernel_init_gpu_if_needed();
 }
 
 void gkmkernel_init_problems(union svm_data *x, int n)
@@ -2624,6 +2739,9 @@ void gkmkernel_destroy()
     kmertree_destroy(g_kmertree);
 
     g_kmertree = NULL;
+    
+    // Cleanup GPU acceleration
+    gkmkernel_cleanup_gpu();
 }
 
 
@@ -2712,8 +2830,6 @@ double* gkmkernel_kernelfunc_batch(const gkm_data *da, const union svm_data *db_
     if (g_param->kernel_type == EST_TRUNC_RBF || g_param->kernel_type == EST_TRUNC_PW_RBF) {
         for (i=0; i<n; i++) {
             res[i] = exp(g_param->gamma*(res[i]-1));
-        }
-    }
 
     gettimeofday(&time_end, NULL);
     clog_trace(CLOG(LOGGER_ID), "DFS n=%d (%ld ms)", n, diff_ms(time_end, time_start));
@@ -2814,7 +2930,10 @@ double* gkmexplainsinglebasekernel_kernelfunc_batch_sv(
     gkmexplainsinglebasekernel_kernelfunc_batch_single(
         da, g_sv_kmertree, 0, g_sv_num, res, singlebasepersv_explanation);
 
-    //normalization
+    //normalization. res ultimately stores the result of the kernel for each support
+    // vector. da->sqnorm would store the magnitude of the input sequence's
+    // gapped kmer embedding while g_sv_svm_data[j].d->sqnorm would store the
+    // support vector's gapped kmer vector magnitude 
     double da_sqnorm = da->sqnorm;
     for (j=0; j<g_sv_num; j++) {
         double denom = (da_sqnorm*g_sv_svm_data[j].d->sqnorm);
@@ -2824,20 +2943,21 @@ double* gkmexplainsinglebasekernel_kernelfunc_batch_sv(
         }
     }
 
-    double per_sv_total, diff_from_ref;
     //RBF kernel
+    double per_sv_total, diff_from_ref;
     if (g_param->kernel_type == EST_TRUNC_RBF || g_param->kernel_type == EST_TRUNC_PW_RBF || g_param->kernel_type == GKM_RBF) {
         for (j=0; j<g_sv_num; j++) {
+            //let the reference be the case where res[j] = 0
             per_sv_total = res[j];
             res[j] = exp(g_param->gamma*(res[j]-1));
             diff_from_ref = res[j] -  exp(g_param->gamma*(-1));
             //distribute diff_from_ref proportionally
-            for (h=0; h<MAX_ALPHABET_SIZE; h++) {
+            for (k=0; k<MAX_ALPHABET_SIZE; k++) {
                 if (per_sv_total > 0) {
-                    singlebasepersv_explanation[h][j] = diff_from_ref*(
-                     singlebasepersv_explanation[h][j]/per_sv_total);
+                    singlebasepersv_explanation[k][j] = diff_from_ref*(
+                     singlebasepersv_explanation[k][j]/per_sv_total);
                 } else {
-                    singlebasepersv_explanation[h][j] = 0;
+                    singlebasepersv_explanation[k][j] = 0;
                 }
             }
         }
@@ -2869,10 +2989,7 @@ double* gkmexplainkernel_kernelfunc_batch_sv(const gkm_data *da, double *res, do
 
     gkmexplainkernel_kernelfunc_batch_single(da, g_sv_kmertree, 0, g_sv_num, res, persv_explanation, mode);
 
-    //normalization. res ultimately stores the result of the kernel for each support
-    // vector. da->sqnorm would store the magnitude of the input sequence's
-    // gapped kmer embedding while g_sv_svm_data[j].d->sqnorm would store the
-    // support vector's gapped kmer vector magnitude 
+    //normalization. res ultimately stores the result of the kernel for each support vector. da->sqnorm would store the magnitude of the input sequence's gapped kmer embedding while g_sv_svm_data[j].d->sqnorm would store the support vector's gapped kmer vector magnitude 
     double da_sqnorm = da->sqnorm;
     for (j=0; j<g_sv_num; j++) {
         double denom = (da_sqnorm*g_sv_svm_data[j].d->sqnorm);
@@ -3162,6 +3279,7 @@ static bool read_model_header(FILE *fp, svm_model* model)
             for(int i=0;i<n;i++)
                 FSCANF(fp,"%lf",&model->rho[i]);
         }
+
         else if(strcmp(cmd,"label")==0)
         {
             int n = model->nr_class;
@@ -3312,8 +3430,7 @@ svm_model *svm_load_model(const char *model_file_name,
     setlocale(LC_ALL, old_locale);
     free(old_locale);
 
-    if (ferror(fp) != 0 || fclose(fp) != 0)
-        return NULL;
+    if (ferror(fp) != 0 || fclose(fp) != 0) return NULL;
 
     model->free_sv = 1; // XXX
 
@@ -3398,12 +3515,12 @@ double* gkmkernel_mkl_kernelfunc_batch(const gkm_data *da, const union svm_data 
             
             gkmkernel_kernelfunc_batch(da, db_array, n, gkm_res);
             
-            // Use optimized parallel RBF computation
+            // Use GPU-accelerated RBF computation when available
             db_ptrs = (const gkm_data **) malloc(sizeof(gkm_data *) * n);
             for (i = 0; i < n; i++) {
                 db_ptrs[i] = db_array[i].d;
             }
-            rbf_kernel_batch_parallel(da, db_ptrs, n, g_param->rbf_gamma, rbf_res, g_param->normalize_kernels);
+            rbf_kernel_batch_adaptive(da, db_ptrs, n, g_param->rbf_gamma, rbf_res, g_param->normalize_kernels);
             free(db_ptrs);
             
             for (i = 0; i < n; i++) {
@@ -3419,12 +3536,12 @@ double* gkmkernel_mkl_kernelfunc_batch(const gkm_data *da, const union svm_data 
             break;
             
         case MKL_RBF_ONLY:
-            // Use optimized parallel RBF computation
+            // Use GPU-accelerated RBF computation when available
             db_ptrs = (const gkm_data **) malloc(sizeof(gkm_data *) * n);
             for (i = 0; i < n; i++) {
                 db_ptrs[i] = db_array[i].d;
             }
-            rbf_kernel_batch_parallel(da, db_ptrs, n, g_param->rbf_gamma, res, g_param->normalize_kernels);
+            rbf_kernel_batch_adaptive(da, db_ptrs, n, g_param->rbf_gamma, res, g_param->normalize_kernels);
             free(db_ptrs);
             break;
             
@@ -3454,12 +3571,12 @@ double* gkmkernel_mkl_kernelfunc_batch_all(const int a, const int start, const i
             
             gkmkernel_kernelfunc_batch_all(a, start, end, gkm_res);
             
-            // Use optimized parallel RBF computation
+            // Use GPU-accelerated RBF computation when available
             db_ptrs = (const gkm_data **) malloc(sizeof(gkm_data *) * (end - start));
             for (j = 0; j < end - start; j++) {
                 db_ptrs[j] = g_prob_svm_data[start + j].d;
             }
-            rbf_kernel_batch_parallel(da, db_ptrs, end - start, g_param->rbf_gamma, rbf_res, g_param->normalize_kernels);
+            rbf_kernel_batch_adaptive(da, db_ptrs, end - start, g_param->rbf_gamma, rbf_res, g_param->normalize_kernels);
             free(db_ptrs);
             
             for (j = 0; j < end - start; j++) {
@@ -3475,12 +3592,12 @@ double* gkmkernel_mkl_kernelfunc_batch_all(const int a, const int start, const i
             break;
             
         case MKL_RBF_ONLY:
-            // Use optimized parallel RBF computation
+            // Use GPU-accelerated RBF computation when available
             db_ptrs = (const gkm_data **) malloc(sizeof(gkm_data *) * (end - start));
             for (j = 0; j < end - start; j++) {
                 db_ptrs[j] = g_prob_svm_data[start + j].d;
             }
-            rbf_kernel_batch_parallel(da, db_ptrs, end - start, g_param->rbf_gamma, res, g_param->normalize_kernels);
+            rbf_kernel_batch_adaptive(da, db_ptrs, end - start, g_param->rbf_gamma, res, g_param->normalize_kernels);
             free(db_ptrs);
             break;
             
@@ -3491,8 +3608,6 @@ double* gkmkernel_mkl_kernelfunc_batch_all(const int a, const int start, const i
             }
             break;
     }
-    
-    return res;
 }
 
 double* gkmkernel_mkl_kernelfunc_batch_sv(const gkm_data *d, double *res)
@@ -3509,12 +3624,12 @@ double* gkmkernel_mkl_kernelfunc_batch_sv(const gkm_data *d, double *res)
             
             gkmkernel_kernelfunc_batch_sv(d, gkm_res);
             
-            // Use optimized parallel RBF computation
+            // Use GPU-accelerated RBF computation when available
             sv_ptrs = (const gkm_data **) malloc(sizeof(gkm_data *) * g_sv_num);
             for (i = 0; i < g_sv_num; i++) {
                 sv_ptrs[i] = g_sv_svm_data[i].d;
             }
-            rbf_kernel_batch_parallel(d, sv_ptrs, g_sv_num, g_param->rbf_gamma, rbf_res, g_param->normalize_kernels);
+            rbf_kernel_batch_adaptive(d, sv_ptrs, g_sv_num, g_param->rbf_gamma, rbf_res, g_param->normalize_kernels);
             free(sv_ptrs);
             
             for (i = 0; i < g_sv_num; i++) {
@@ -3530,12 +3645,12 @@ double* gkmkernel_mkl_kernelfunc_batch_sv(const gkm_data *d, double *res)
             break;
             
         case MKL_RBF_ONLY:
-            // Use optimized parallel RBF computation
+            // Use GPU-accelerated RBF computation when available
             sv_ptrs = (const gkm_data **) malloc(sizeof(gkm_data *) * g_sv_num);
             for (i = 0; i < g_sv_num; i++) {
                 sv_ptrs[i] = g_sv_svm_data[i].d;
             }
-            rbf_kernel_batch_parallel(d, sv_ptrs, g_sv_num, g_param->rbf_gamma, res, g_param->normalize_kernels);
+            rbf_kernel_batch_adaptive(d, sv_ptrs, g_sv_num, g_param->rbf_gamma, res, g_param->normalize_kernels);
             free(sv_ptrs);
             break;
             
@@ -3546,8 +3661,6 @@ double* gkmkernel_mkl_kernelfunc_batch_sv(const gkm_data *d, double *res)
             }
             break;
     }
-    
-    return res;
 }
 
 void gkmkernel_mkl_optimize_weights(const struct svm_problem *prob, struct svm_parameter *param)
@@ -3574,29 +3687,69 @@ void gkmkernel_mkl_optimize_weights(const struct svm_problem *prob, struct svm_p
     int completed = 0;
     double last_percent = -1.0;
     
-    for (i = 0; i < n; i++) {
-        for (j = 0; j < n; j++) {
-            int idx = i * n + j;
+    // For large datasets, use batch computation for efficiency
+    if (n > 100) {
+        clog_info(CLOG(LOGGER_ID), "Using batch computation for large dataset (n=%d)", n);
+        
+        // Compute RBF kernels in batch for better GPU utilization
+        const gkm_data **data_ptrs = (const gkm_data **) malloc(sizeof(gkm_data *) * n);
+        double *batch_results = (double *) malloc(sizeof(double) * n);
+        
+        for (i = 0; i < n; i++) {
+            data_ptrs[i] = prob->x[i].d;
+        }
+        
+        for (i = 0; i < n; i++) {
+            // Compute GKM kernels (row-wise)
+            for (j = 0; j < n; j++) {
+                gkm_kernels[i * n + j] = gkmkernel_kernelfunc(prob->x[i].d, prob->x[j].d);
+            }
             
-            // Compute GKM kernel
-            // clog_info(CLOG(LOGGER_ID), "Computing GKM kernel for pair (%d, %d)", i, j);
-            gkm_kernels[idx] = gkmkernel_kernelfunc(prob->x[i].d, prob->x[j].d);
+            // Compute RBF kernels in batch for row i
+            rbf_kernel_batch_adaptive(prob->x[i].d, data_ptrs, n, param->rbf_gamma, 
+                                    batch_results, param->normalize_kernels);
             
-            // Compute RBF kernel
-            // clog_info(CLOG(LOGGER_ID), "Computing RBF kernel for pair (%d, %d)", i, j);
-            if (param->normalize_kernels) {
-                rbf_kernels[idx] = rbf_kernel_normalize(prob->x[i].d, prob->x[j].d, param->rbf_gamma);
-            } else {
-                rbf_kernels[idx] = rbf_kernel(prob->x[i].d, prob->x[j].d, param->rbf_gamma);
+            // Copy batch results to kernel matrix
+            for (j = 0; j < n; j++) {
+                rbf_kernels[i * n + j] = batch_results[j];
             }
             
             // Update progress
-            completed++;
+            completed += n;
             double percent = (completed * 100.0) / total_pairs;
-            if ((percent - last_percent >= 0.01) || (percent == 100.0)) {
-                clog_info(CLOG(LOGGER_ID), "Kernel matrix computation: %.2f%% complete (%d/%d)", 
+            if ((percent - last_percent >= 1.0) || (percent == 100.0)) {
+                clog_info(CLOG(LOGGER_ID), "Kernel matrix computation: %.1f%% complete (%d/%d)", 
                          percent, completed, total_pairs);
                 last_percent = percent;
+            }
+        }
+        
+        free(data_ptrs);
+        free(batch_results);
+    } else {
+        // For small datasets, use individual kernel computations
+        for (i = 0; i < n; i++) {
+            for (j = 0; j < n; j++) {
+                int idx = i * n + j;
+                
+                // Compute GKM kernel
+                gkm_kernels[idx] = gkmkernel_kernelfunc(prob->x[i].d, prob->x[j].d);
+                
+                // Compute RBF kernel
+                if (param->normalize_kernels) {
+                    rbf_kernels[idx] = rbf_kernel_normalize(prob->x[i].d, prob->x[j].d, param->rbf_gamma);
+                } else {
+                    rbf_kernels[idx] = rbf_kernel(prob->x[i].d, prob->x[j].d, param->rbf_gamma);
+                }
+                
+                // Update progress
+                completed++;
+                double percent = (completed * 100.0) / total_pairs;
+                if ((percent - last_percent >= 5.0) || (percent == 100.0)) {
+                    clog_info(CLOG(LOGGER_ID), "Kernel matrix computation: %.1f%% complete (%d/%d)", 
+                             percent, completed, total_pairs);
+                    last_percent = percent;
+                }
             }
         }
     }
@@ -3677,5 +3830,18 @@ void gkmkernel_mkl_optimize_weights(const struct svm_problem *prob, struct svm_p
     
     free(gkm_kernels);
     free(rbf_kernels);
+}
+
+/* GPU acceleration interface functions */
+void gkmkernel_init_gpu_if_needed(void) {
+    // Estimate reasonable defaults for batch size and covariates
+    int max_batch_size = 10000;  // Conservative default
+    int max_covariates = 1000;   // Conservative default
+    
+    init_gpu_acceleration(max_batch_size, max_covariates);
+}
+
+void gkmkernel_cleanup_gpu(void) {
+    cleanup_gpu_acceleration();
 }
 

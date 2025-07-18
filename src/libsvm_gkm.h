@@ -104,6 +104,10 @@ double gkmkernel_predict(const gkm_data *d);
 int svm_save_model(const char *model_file_name, const struct svm_model *model);
 svm_model *svm_load_model(const char *model_file_name, uint8_t force_nonlinear_init);
 
+/* GPU acceleration functions */
+void gkmkernel_init_gpu_if_needed(void);
+void gkmkernel_cleanup_gpu(void);
+
 
 #ifdef __cplusplus
 }
