@@ -240,10 +240,18 @@ protected:
         //gkmkernel_kernelfunc_batch(x[i].d, (x+j_start), (j_end-j_start), kvalue);
         //gkmkernel_kernelfunc_batch_all(i, j_start, j_end, temp_kvalue);
         
-        if (j_end - j_start < 100) {
-            gkmkernel_kernelfunc_batch(x[i].d, (x+j_start), (j_end-j_start), temp_kvalue);
+        if (kernel_type == MKL_GKM_RBF || kernel_type == MKL_GKM_ONLY || kernel_type == MKL_RBF_ONLY) {
+            if (j_end - j_start < 100) {
+                gkmkernel_mkl_kernelfunc_batch(x[i].d, (x+j_start), (j_end-j_start), temp_kvalue);
+            } else {
+                gkmkernel_mkl_kernelfunc_batch_all(i, j_start, j_end, temp_kvalue);
+            }
         } else {
-            gkmkernel_kernelfunc_batch_all(i, j_start, j_end, temp_kvalue);
+            if (j_end - j_start < 100) {
+                gkmkernel_kernelfunc_batch(x[i].d, (x+j_start), (j_end-j_start), temp_kvalue);
+            } else {
+                gkmkernel_kernelfunc_batch_all(i, j_start, j_end, temp_kvalue);
+            }
         }
 
         //debug
@@ -268,7 +276,11 @@ private:
 
     double kernel_gkm(int i, int j) const
     {
-        return gkmkernel_kernelfunc(x[i].d, x[j].d);
+        if (kernel_type == MKL_GKM_RBF || kernel_type == MKL_GKM_ONLY || kernel_type == MKL_RBF_ONLY) {
+            return gkmkernel_mkl_kernelfunc(x[i].d, x[j].d);
+        } else {
+            return gkmkernel_kernelfunc(x[i].d, x[j].d);
+        }
     }
 };
 
@@ -277,7 +289,14 @@ Kernel::Kernel(int l, svm_data const * x_, const svm_parameter& param)
 {
     kernel_function = &Kernel::kernel_gkm;
     clone(x,x_,l);
-    gkmkernel_init_problems(x, l); //build kmertree using the entire problem set, which will then be used by gkmkernel_kernelfunc_batch_all
+    
+    if (kernel_type == MKL_GKM_RBF || kernel_type == MKL_GKM_ONLY || kernel_type == MKL_RBF_ONLY) {
+        gkmkernel_mkl_init((struct svm_parameter *)&param);
+        gkmkernel_init_problems(x, l); //build kmertree using the entire problem set, which will then be used by gkmkernel_kernelfunc_batch_all
+    } else {
+        gkmkernel_init_problems(x, l); //build kmertree using the entire problem set, which will then be used by gkmkernel_kernelfunc_batch_all
+    }
+    
     temp_kvalue = new double [l];
 }
 
@@ -286,6 +305,10 @@ Kernel::~Kernel()
     delete [] x;
     delete [] temp_kvalue;
     gkmkernel_destroy_problems();
+    
+    if (kernel_type == MKL_GKM_RBF || kernel_type == MKL_GKM_ONLY || kernel_type == MKL_RBF_ONLY) {
+        gkmkernel_mkl_destroy();
+    }
 }
 
 double Kernel::k_function(const svm_data x, const svm_data y)
@@ -2059,6 +2082,11 @@ svm_model *svm_train(const svm_problem *prob, const svm_parameter *param)
     model->param = *param;
     model->free_sv = 0; // XXX
 
+    // Optimize MKL weights if using MKL
+    if(param->kernel_type == MKL_GKM_RBF) {
+        gkmkernel_mkl_optimize_weights(prob, &model->param);
+    }
+
     if(param->svm_type == ONE_CLASS ||
        param->svm_type == EPSILON_SVR ||
        param->svm_type == NU_SVR)
@@ -2554,7 +2582,11 @@ double svm_predict_values(const svm_model *model, const svm_data x, double* dec_
         double *sv_coef = model->sv_coef[0];
         double sum = 0;
 
-        gkmkernel_kernelfunc_batch_sv(x.d, kvalue);
+        if(model->param.kernel_type == MKL_GKM_RBF || model->param.kernel_type == MKL_GKM_ONLY || model->param.kernel_type == MKL_RBF_ONLY) {
+            gkmkernel_mkl_kernelfunc_batch_sv(x.d, kvalue);
+        } else {
+            gkmkernel_kernelfunc_batch_sv(x.d, kvalue);
+        }
 
         for(i=0;i<l;i++)
             sum += sv_coef[i] * kvalue[i];
@@ -2573,7 +2605,7 @@ double svm_predict_values(const svm_model *model, const svm_data x, double* dec_
         int nr_class = model->nr_class;
 
         //for speed-up
-        if ((nr_class == 2) && (model->param.kernel_type != EST_TRUNC_RBF) && (model->param.kernel_type != GKM_RBF) && (model->param.kernel_type != EST_TRUNC_PW_RBF)) {
+        if ((nr_class == 2) && (model->param.kernel_type != EST_TRUNC_RBF) && (model->param.kernel_type != GKM_RBF) && (model->param.kernel_type != EST_TRUNC_PW_RBF) && (model->param.kernel_type != MKL_GKM_RBF) && (model->param.kernel_type != MKL_GKM_ONLY) && (model->param.kernel_type != MKL_RBF_ONLY)) {
             dec_values[0] = gkmkernel_predict(x.d) - model->rho[0];
 
             free(kvalue);
@@ -2584,7 +2616,11 @@ double svm_predict_values(const svm_model *model, const svm_data x, double* dec_
                 return model->label[1];
         }
 
-        gkmkernel_kernelfunc_batch_sv(x.d, kvalue);
+        if(model->param.kernel_type == MKL_GKM_RBF || model->param.kernel_type == MKL_GKM_ONLY || model->param.kernel_type == MKL_RBF_ONLY) {
+            gkmkernel_mkl_kernelfunc_batch_sv(x.d, kvalue);
+        } else {
+            gkmkernel_kernelfunc_batch_sv(x.d, kvalue);
+        }
 
         //start is just storing the index for which support vectors start
         // corresponding to a particular class
@@ -3047,7 +3083,10 @@ const char *svm_check_parameter(const svm_problem *prob, const svm_parameter *pa
        kernel_type != EST_TRUNC &&
        kernel_type != EST_TRUNC_RBF && kernel_type != GKM_RBF &&
        kernel_type != EST_TRUNC_PW &&
-       kernel_type != EST_TRUNC_PW_RBF)
+       kernel_type != EST_TRUNC_PW_RBF &&
+       kernel_type != MKL_GKM_RBF &&
+       kernel_type != MKL_GKM_ONLY &&
+       kernel_type != MKL_RBF_ONLY)
         return "unknown kernel type";
 
     if(param->L < 2)
@@ -3061,6 +3100,38 @@ const char *svm_check_parameter(const svm_problem *prob, const svm_parameter *pa
 
     if(param->d > (param->L - param->k))
         return "d > L - k";
+
+    // MKL-specific parameter validation
+    if(kernel_type == MKL_GKM_RBF || kernel_type == MKL_RBF_ONLY) {
+        if(param->rbf_gamma <= 0)
+            return "rbf_gamma <= 0";
+    }
+
+    if(kernel_type == MKL_GKM_RBF) {
+        if(param->gkm_weight < 0 || param->rbf_weight < 0)
+            return "MKL weights cannot be negative";
+        if(param->gkm_weight + param->rbf_weight <= 0)
+            return "sum of MKL weights must be positive";
+        if(param->mkl_iterations <= 0)
+            return "mkl_iterations <= 0";
+        if(param->mkl_tolerance <= 0)
+            return "mkl_tolerance <= 0";
+    }
+
+    // Check if covariates are provided when needed
+    if(kernel_type == MKL_GKM_RBF || kernel_type == MKL_RBF_ONLY) {
+        // Check if at least one data point has covariates
+        int has_covariates = 0;
+        int i;
+        for(i = 0; i < prob->l; i++) {
+            if(prob->x[i].d->num_covariates > 0) {
+                has_covariates = 1;
+                break;
+            }
+        }
+        if(!has_covariates)
+            return "MKL kernels require covariate data";
+    }
 
 
     // cache_size,eps,C,nu,p,shrinking

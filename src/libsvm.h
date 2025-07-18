@@ -30,6 +30,10 @@ typedef struct _gkm_data {
     char *seq_string;
 
     double sqnorm;
+    
+    /* covariate data for MKL */
+    double *covariates;
+    int num_covariates;
 } gkm_data;
 
 union svm_data
@@ -47,7 +51,8 @@ struct svm_problem
 enum { C_SVC, NU_SVC, ONE_CLASS, EPSILON_SVR, NU_SVR }; /* svm_type */
 enum { GKMDATA }; /* data_type */
 enum { GKM, EST_FULL, EST_TRUNC, EST_TRUNC_RBF,
-       EST_TRUNC_PW, EST_TRUNC_PW_RBF, GKM_RBF}; /* kernel_type */
+       EST_TRUNC_PW, EST_TRUNC_PW_RBF, GKM_RBF, 
+       MKL_GKM_RBF, MKL_GKM_ONLY, MKL_RBF_ONLY}; /* kernel_type */
 
 struct svm_parameter
 {
@@ -60,6 +65,14 @@ struct svm_parameter
     uint8_t M;
     double H;
     double gamma;
+    
+    /* MKL parameters */
+    double rbf_gamma;        /* gamma for RBF kernel on covariates */
+    double gkm_weight;       /* weight for GKM kernel in MKL */
+    double rbf_weight;       /* weight for RBF kernel in MKL */
+    int mkl_iterations;      /* max iterations for MKL optimization */
+    double mkl_tolerance;    /* convergence tolerance for MKL */
+    int normalize_kernels;   /* whether to normalize individual kernels */
 
     /* these are for training only */
     double cache_size; /* in MB */

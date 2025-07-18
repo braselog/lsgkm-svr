@@ -62,6 +62,37 @@ static uint8_t *g_mmcnt_lookuptab = NULL;
 static int g_mmcnt_lookuptab_mask = 0;
 static int g_mmcnt_nlookups = 0;
 
+/* RBF kernel functions for MKL */
+static double rbf_kernel(const gkm_data *da, const gkm_data *db, double gamma)
+{
+    if (da->num_covariates != db->num_covariates) {
+        clog_error(CLOG(LOGGER_ID), "mismatched number of covariates: %d vs %d", 
+                   da->num_covariates, db->num_covariates);
+        return 0.0;
+    }
+    
+    double sum = 0.0;
+    int i;
+    for (i = 0; i < da->num_covariates; i++) {
+        double diff = da->covariates[i] - db->covariates[i];
+        sum += diff * diff;
+    }
+    
+    return exp(-gamma * sum);
+}
+
+static double rbf_kernel_normalize(const gkm_data *da, const gkm_data *db, double gamma)
+{
+    double self_a = rbf_kernel(da, da, gamma);
+    double self_b = rbf_kernel(db, db, gamma);
+    double cross = rbf_kernel(da, db, gamma);
+    
+    if (self_a * self_b > 0) {
+        return cross / sqrt(self_a * self_b);
+    }
+    return 0.0;
+}
+
 typedef struct _BaseMismatchCount {
     uint8_t *bid;
     uint8_t wt;
@@ -1010,7 +1041,6 @@ static void kmertree_dfs_explainsinglebase(
         int daughter_node_index = (curr_node_index*MAX_ALPHABET_SIZE);
         for (bid=1; bid<=MAX_ALPHABET_SIZE; bid++) {
             daughter_node_index++;
-            tree_lmer[depth] = bid;
             if (tree->node[daughter_node_index] > 0) {
                 BaseMismatchCountExplainSingleBase next_matching_bases[MAX_SEQ_LENGTH];
                 int next_num_matching_bases = 0;
@@ -1030,14 +1060,7 @@ static void kmertree_dfs_explainsinglebase(
                         //    next_matching_bases[next_num_matching_bases].match_at_key_base = 1;
                         //}
                         next_num_matching_bases++;
-                    //either the number of mismatches has not exceeded the threshold, or
-                    //the number of mismatches is d and it's a base
-                    //that overlaps the relevant position, meaning a flip to a match
-                    //could make the base relevant
-                    } else if ((currbase_mmcnt < d) || 
-                               ((currbase_mmcnt == d) &&
-                                (pos_to_explain-currbase_seqpos < L) &&
-                                (pos_to_explain >= currbase_seqpos))) {
+                    } else if (currbase_mmcnt < d) {
                         // non-matching
                         next_matching_bases[next_num_matching_bases].bid = currbase_ptr+1;
                         next_matching_bases[next_num_matching_bases].wt = curr_matching_bases[j].wt;
@@ -1049,7 +1072,11 @@ static void kmertree_dfs_explainsinglebase(
                 }
 
                 if (next_num_matching_bases > 0) {
-                    kmertree_dfs_explainsinglebase(tree, last_seqid, depth+1, daughter_node_index, next_matching_bases, next_num_matching_bases, mmprof, tree_lmer, pos_to_explain, base_at_pos_to_explain, singlebase_mmprof);
+                    kmertree_dfs_explainsinglebase(tree, last_seqid, depth+1,
+                     daughter_node_index, next_matching_bases,
+                     next_num_matching_bases, mmprof, tree_lmer,
+                     pos_to_explain, base_at_pos_to_explain,
+                     singlebase_mmprof);
                 } 
             }
         }
@@ -1664,7 +1691,11 @@ static void gkmexplainkernel_kernelfunc_batch_single(
         for(j=0; j<end; j++) { mmprofile[k][j] = 0; }
     }
 
-    int *tree_lmer;
+    int *tree_lmer = (int *) malloc(sizeof(int) * ((size_t) g_param->L ));
+    assert((da->seqlen-1)%2 == 0);
+    int pos_to_explain = (da->seqlen - 1)/2;
+    uint8_t base_at_pos_to_explain = da->seq[pos_to_explain]; 
+    
     switch (mode) {
         case 0:
             kmertree_dfs_withexplanation(tree, end, 0, 0, matching_bases,
@@ -1708,30 +1739,15 @@ static void gkmexplainkernel_kernelfunc_batch_single(
         for (k=0; k<=d; k++) {
             sum += (g_weights[k]*mmprofile[k][j]);
         }
-        double sum2 = 0;
-        for (k=0; k < da->seqlen; k++) {
-            sum2 += persv_explanation[k][(da->seq[k])-1][j];
-        }
-        if (mode!=3 && mode!=4) { 
-            assert (fabs(sum-sum2) < 0.0000001);
-        }
         res[j-start] = sum;
     }
 
-    //free mmprofile
-    for (k=0; k<=d; k++) {
-        free(mmprofile[k]);
-    }
-    free(mmprofile);
-
-    //I have no idea whether I'm supposed to do a free here since I am
-    //not a c programmer
     for (i=0; i<num_matching_bases; i++) {
         //base match history
         free(matching_bases[i].base_lmer_match_history);
     }
-
 }
+
 
 static void gkmkernel_kernelfunc_batch_par4(const gkm_data *da, KmerTree *tree, const int start, const int end, double *res)
 {
@@ -2120,6 +2136,10 @@ gkm_data* gkmkernel_new_object(char *seq, char *sid, int seqid)
     d->sqnorm = gkmkernel_kernelfunc_sqnorm(d);
 	clog_trace(CLOG(LOGGER_ID), "%d's sqnorm is %f", seqid, d->sqnorm);
 
+    /* initialize covariate fields */
+    d->covariates = NULL;
+    d->num_covariates = 0;
+
     return(d);
 }
 
@@ -2134,6 +2154,7 @@ void gkmkernel_delete_object(gkm_data* d)
     if (d->seq) free(d->seq);
     if (d->seq_rc) free(d->seq_rc);
     if (d->sid) free(d->sid);
+    if (d->covariates) free(d->covariates);
 
     free(d);
 }
@@ -2149,6 +2170,7 @@ void gkmkernel_free_object(gkm_data* d)
     if (d->seq) free(d->seq);
     if (d->seq_rc) free(d->seq_rc);
     if (d->sid) free(d->sid);
+    if (d->covariates) free(d->covariates);
 
     d->kmerids = NULL;
     d->kmerids_rc = NULL;
@@ -2158,6 +2180,8 @@ void gkmkernel_free_object(gkm_data* d)
     d->seq = NULL;
     d->seq_rc = NULL;
     d->sid = NULL;
+    d->covariates = NULL;
+    d->num_covariates = 0;
 }
 
 /* set the extra parameters for gkmkernel */
@@ -2197,6 +2221,15 @@ void gkmkernel_init(struct svm_parameter *param)
             break;
         case EST_TRUNC_PW_RBF:
             calc_gkm_kernel_lmerest_wt(1);
+            break;
+        case MKL_GKM_RBF:
+            calc_gkm_kernel_lmerest_wt(1);
+            break;
+        case MKL_GKM_ONLY:
+            calc_gkm_kernel_lmerest_wt(1);
+            break;
+        case MKL_RBF_ONLY:
+            /* No GKM weights needed for RBF-only */
             break;
         default:
             calc_gkm_kernel_lmerest_wt(1);
@@ -2446,7 +2479,7 @@ double* gkmkernel_kernelfunc_batch(const gkm_data *da, const union svm_data *db_
     }
 
     //RBF kernel
-    if (g_param->kernel_type == EST_TRUNC_RBF || g_param->kernel_type == EST_TRUNC_PW_RBF || g_param->kernel_type == GKM_RBF) {
+    if (g_param->kernel_type == EST_TRUNC_RBF || g_param->kernel_type == EST_TRUNC_PW_RBF) {
         for (i=0; i<n; i++) {
             res[i] = exp(g_param->gamma*(res[i]-1));
         }
@@ -2493,7 +2526,44 @@ double* gkmkernel_kernelfunc_batch_all(const int a, const int start, const int e
     return res;
 }
 
-/* calculate multiple kernels WITH EXPLANATION ON SINGLE BASE using precomputed kmertree with all samples */
+/* calculate multiple kernels using precomputed kmertree with SVs */
+double* gkmkernel_kernelfunc_batch_sv(const gkm_data *d, double *res)
+{
+    if (g_sv_kmertree == NULL) {
+        clog_error(CLOG(LOGGER_ID), "kmertree for SVs has not been initialized. Call gkmkernel_init_sv_kmertree_objects() first and make sure g_sv_kmertree gets initialized within it.");
+        return NULL;
+    }
+
+    int j;
+    struct timeval time_start, time_end;
+
+    gettimeofday(&time_start, NULL);
+
+    //initialize results
+    for (j=0; j<g_sv_num; j++) { res[j] = 0; }
+
+    gkmkernel_kernelfunc_batch_ptr(d, g_sv_kmertree, 0, g_sv_num, res);
+
+    //normalization
+    double da_sqnorm = d->sqnorm;
+    for (j=0; j<g_sv_num; j++) {
+        res[j] /= (da_sqnorm*g_sv_svm_data[j].d->sqnorm);
+    }
+
+    //RBF kernel
+    if (g_param->kernel_type == EST_TRUNC_RBF || g_param->kernel_type == EST_TRUNC_PW_RBF || g_param->kernel_type == GKM_RBF) {
+        for (j=0; j<g_sv_num; j++) {
+            res[j] = exp(g_param->gamma*(res[j]-1));
+        }
+    }
+
+    gettimeofday(&time_end, NULL);
+    clog_trace(CLOG(LOGGER_ID), "DFS nSVs=%d (%ld ms)", g_sv_num, diff_ms(time_end, time_start));
+
+    return res;
+}
+
+/* calculate multiple kernels WITH EXPLANATION ON SINGLE BASE using precomputed kmertree with SVs */
 double* gkmexplainsinglebasekernel_kernelfunc_batch_sv(
     const gkm_data *da, double *res,
     double **singlebasepersv_explanation) 
@@ -2612,43 +2682,6 @@ double* gkmexplainkernel_kernelfunc_batch_sv(const gkm_data *da, double *res, do
     return res;
 }
 
-/* calculate multiple kernels using precomputed kmertree with SVs */
-double* gkmkernel_kernelfunc_batch_sv(const gkm_data *da, double *res) 
-{
-    if (g_sv_kmertree == NULL) {
-        clog_error(CLOG(LOGGER_ID), "kmertree for SVs has not been initialized. call gkmkernel_init_sv() first. Call gkmkernel_init_sv_kmertree_objects() first and make sure g_sv_kmertree gets initialized within it.");
-        return NULL;
-    }
-
-    int j;
-    struct timeval time_start, time_end;
-
-    gettimeofday(&time_start, NULL);
-
-    //initialize results
-    for (j=0; j<g_sv_num; j++) { res[j] = 0; }
-
-    gkmkernel_kernelfunc_batch_ptr(da, g_sv_kmertree, 0, g_sv_num, res);
-
-    //normalization
-    double da_sqnorm = da->sqnorm;
-    for (j=0; j<g_sv_num; j++) {
-        res[j] /= (da_sqnorm*g_sv_svm_data[j].d->sqnorm);
-    }
-
-    //RBF kernel
-    if (g_param->kernel_type == EST_TRUNC_RBF || g_param->kernel_type == EST_TRUNC_PW_RBF || g_param->kernel_type == GKM_RBF) {
-        for (j=0; j<g_sv_num; j++) {
-            res[j] = exp(g_param->gamma*(res[j]-1));
-        }
-    }
-
-    gettimeofday(&time_end, NULL);
-    clog_trace(CLOG(LOGGER_ID), "DFS nSVs=%d (%ld ms)", g_sv_num, diff_ms(time_end, time_start));
-
-    return res;
-}
-
 double gkmkernel_predict(const gkm_data *d)
 {
     double result = 0;
@@ -2659,7 +2692,7 @@ double gkmkernel_predict(const gkm_data *d)
     }
 
     //Note: no breakdown by individual support vector...seems like the info
-    // on the alpha values was built into kmertreecoef. Rescaling by
+    // on the alpha values was built-in to kmertreecoef. Rescaling by
     // the magnitude of the gapped kmer vector must also be built in.
     if (g_param_nthreads == 1) {
         result = kmertreecoef_dfs_single(d);
@@ -3058,5 +3091,331 @@ svm_model *svm_load_model(const char *model_file_name,
     g_sv_num = model->l;
 
     return model;
+}
+
+/* MKL (Multiple Kernel Learning) implementation */
+static double *g_gkm_kernel_matrix = NULL;
+static double *g_rbf_kernel_matrix = NULL;
+static int g_kernel_matrix_size = 0;
+
+void gkmkernel_mkl_init(struct svm_parameter *param)
+{
+    g_param = param;
+    if (param->kernel_type == MKL_GKM_RBF || param->kernel_type == MKL_GKM_ONLY) {
+        gkmkernel_init(param);
+    }
+}
+
+void gkmkernel_mkl_destroy()
+{
+    if (g_gkm_kernel_matrix) {
+        free(g_gkm_kernel_matrix);
+        g_gkm_kernel_matrix = NULL;
+    }
+    if (g_rbf_kernel_matrix) {
+        free(g_rbf_kernel_matrix);
+        g_rbf_kernel_matrix = NULL;
+    }
+    g_kernel_matrix_size = 0;
+    
+    if (g_param->kernel_type == MKL_GKM_RBF || g_param->kernel_type == MKL_GKM_ONLY) {
+        gkmkernel_destroy();
+    }
+}
+
+double gkmkernel_mkl_kernelfunc(const gkm_data *da, const gkm_data *db)
+{
+    double gkm_val = 0.0;
+    double rbf_val = 0.0;
+    
+    switch (g_param->kernel_type) {
+        case MKL_GKM_RBF:
+            gkm_val = gkmkernel_kernelfunc(da, db);
+            if (g_param->normalize_kernels) {
+                rbf_val = rbf_kernel_normalize(da, db, g_param->rbf_gamma);
+            } else {
+                rbf_val = rbf_kernel(da, db, g_param->rbf_gamma);
+            }
+            return g_param->gkm_weight * gkm_val + g_param->rbf_weight * rbf_val;
+            
+        case MKL_GKM_ONLY:
+            return gkmkernel_kernelfunc(da, db);
+            
+        case MKL_RBF_ONLY:
+            if (g_param->normalize_kernels) {
+                return rbf_kernel_normalize(da, db, g_param->rbf_gamma);
+            } else {
+                return rbf_kernel(da, db, g_param->rbf_gamma);
+            }
+            
+        default:
+            clog_error(CLOG(LOGGER_ID), "unsupported MKL kernel type: %d", g_param->kernel_type);
+            return 0.0;
+    }
+}
+
+double* gkmkernel_mkl_kernelfunc_batch(const gkm_data *da, const union svm_data *db_array, const int n, double *res)
+{
+    int i;
+    double *gkm_res = NULL;
+    double *rbf_res = NULL;
+    
+    switch (g_param->kernel_type) {
+        case MKL_GKM_RBF:
+            gkm_res = (double *) malloc(sizeof(double) * n);
+            rbf_res = (double *) malloc(sizeof(double) * n);
+            
+            gkmkernel_kernelfunc_batch(da, db_array, n, gkm_res);
+            
+            for (i = 0; i < n; i++) {
+                if (g_param->normalize_kernels) {
+                    rbf_res[i] = rbf_kernel_normalize(da, db_array[i].d, g_param->rbf_gamma);
+                } else {
+                    rbf_res[i] = rbf_kernel(da, db_array[i].d, g_param->rbf_gamma);
+                }
+                res[i] = g_param->gkm_weight * gkm_res[i] + g_param->rbf_weight * rbf_res[i];
+            }
+            
+            free(gkm_res);
+            free(rbf_res);
+            break;
+            
+        case MKL_GKM_ONLY:
+            gkmkernel_kernelfunc_batch(da, db_array, n, res);
+            break;
+            
+        case MKL_RBF_ONLY:
+            for (i = 0; i < n; i++) {
+                if (g_param->normalize_kernels) {
+                    res[i] = rbf_kernel_normalize(da, db_array[i].d, g_param->rbf_gamma);
+                } else {
+                    res[i] = rbf_kernel(da, db_array[i].d, g_param->rbf_gamma);
+                }
+            }
+            break;
+            
+        default:
+            clog_error(CLOG(LOGGER_ID), "unsupported MKL kernel type: %d", g_param->kernel_type);
+            for (i = 0; i < n; i++) {
+                res[i] = 0.0;
+            }
+            break;
+    }
+    
+    return res;
+}
+
+double* gkmkernel_mkl_kernelfunc_batch_all(const int a, const int start, const int end, double *res)
+{
+    int j;
+    const gkm_data *da = g_prob_svm_data[a].d;
+    double *gkm_res = NULL;
+    double *rbf_res = NULL;
+    
+    switch (g_param->kernel_type) {
+        case MKL_GKM_RBF:
+            gkm_res = (double *) malloc(sizeof(double) * (end - start));
+            rbf_res = (double *) malloc(sizeof(double) * (end - start));
+            
+            gkmkernel_kernelfunc_batch_all(a, start, end, gkm_res);
+            
+            for (j = 0; j < end - start; j++) {
+                const gkm_data *db = g_prob_svm_data[start + j].d;
+                if (g_param->normalize_kernels) {
+                    rbf_res[j] = rbf_kernel_normalize(da, db, g_param->rbf_gamma);
+                } else {
+                    rbf_res[j] = rbf_kernel(da, db, g_param->rbf_gamma);
+                }
+                res[j] = g_param->gkm_weight * gkm_res[j] + g_param->rbf_weight * rbf_res[j];
+            }
+            
+            free(gkm_res);
+            free(rbf_res);
+            break;
+            
+        case MKL_GKM_ONLY:
+            gkmkernel_kernelfunc_batch_all(a, start, end, res);
+            break;
+            
+        case MKL_RBF_ONLY:
+            for (j = 0; j < end - start; j++) {
+                const gkm_data *db = g_prob_svm_data[start + j].d;
+                if (g_param->normalize_kernels) {
+                    res[j] = rbf_kernel_normalize(da, db, g_param->rbf_gamma);
+                } else {
+                    res[j] = rbf_kernel(da, db, g_param->rbf_gamma);
+                }
+            }
+            break;
+            
+        default:
+            clog_error(CLOG(LOGGER_ID), "unsupported MKL kernel type: %d", g_param->kernel_type);
+            for (j = 0; j < end - start; j++) {
+                res[j] = 0.0;
+            }
+            break;
+    }
+    
+    return res;
+}
+
+double* gkmkernel_mkl_kernelfunc_batch_sv(const gkm_data *d, double *res)
+{
+    int i;
+    double *gkm_res = NULL;
+    double *rbf_res = NULL;
+    
+    switch (g_param->kernel_type) {
+        case MKL_GKM_RBF:
+            gkm_res = (double *) malloc(sizeof(double) * g_sv_num);
+            rbf_res = (double *) malloc(sizeof(double) * g_sv_num);
+            
+            gkmkernel_kernelfunc_batch_sv(d, gkm_res);
+            
+            for (i = 0; i < g_sv_num; i++) {
+                if (g_param->normalize_kernels) {
+                    rbf_res[i] = rbf_kernel_normalize(d, g_sv_svm_data[i].d, g_param->rbf_gamma);
+                } else {
+                    rbf_res[i] = rbf_kernel(d, g_sv_svm_data[i].d, g_param->rbf_gamma);
+                }
+                res[i] = g_param->gkm_weight * gkm_res[i] + g_param->rbf_weight * rbf_res[i];
+            }
+            
+            free(gkm_res);
+            free(rbf_res);
+            break;
+            
+        case MKL_GKM_ONLY:
+            gkmkernel_kernelfunc_batch_sv(d, res);
+            break;
+            
+        case MKL_RBF_ONLY:
+            for (i = 0; i < g_sv_num; i++) {
+                if (g_param->normalize_kernels) {
+                    res[i] = rbf_kernel_normalize(d, g_sv_svm_data[i].d, g_param->rbf_gamma);
+                } else {
+                    res[i] = rbf_kernel(d, g_sv_svm_data[i].d, g_param->rbf_gamma);
+                }
+            }
+            break;
+            
+        default:
+            clog_error(CLOG(LOGGER_ID), "unsupported MKL kernel type: %d", g_param->kernel_type);
+            for (i = 0; i < g_sv_num; i++) {
+                res[i] = 0.0;
+            }
+            break;
+    }
+    
+    return res;
+}
+
+void gkmkernel_mkl_optimize_weights(const struct svm_problem *prob, struct svm_parameter *param)
+{
+    if (param->kernel_type != MKL_GKM_RBF) {
+        clog_info(CLOG(LOGGER_ID), "MKL weight optimization not needed for kernel type %d", param->kernel_type);
+        return;
+    }
+    
+    int n = prob->l;
+    int i, j, iter;
+    double *gkm_kernels = (double *) malloc(sizeof(double) * n * n);
+    double *rbf_kernels = (double *) malloc(sizeof(double) * n * n);
+    
+    clog_info(CLOG(LOGGER_ID), "Computing kernel matrices for MKL optimization...");
+    
+    // Compute individual kernel matrices
+    for (i = 0; i < n; i++) {
+        for (j = 0; j < n; j++) {
+            int idx = i * n + j;
+            
+            // Compute GKM kernel
+            gkm_kernels[idx] = gkmkernel_kernelfunc(prob->x[i].d, prob->x[j].d);
+            
+            // Compute RBF kernel
+            if (param->normalize_kernels) {
+                rbf_kernels[idx] = rbf_kernel_normalize(prob->x[i].d, prob->x[j].d, param->rbf_gamma);
+            } else {
+                rbf_kernels[idx] = rbf_kernel(prob->x[i].d, prob->x[j].d, param->rbf_gamma);
+            }
+        }
+    }
+    
+    // Simple gradient-based optimization for MKL weights
+    double prev_obj = -1e10;
+    double gkm_weight = param->gkm_weight;
+    double rbf_weight = param->rbf_weight;
+    
+    clog_info(CLOG(LOGGER_ID), "Starting MKL weight optimization...");
+    
+    for (iter = 0; iter < param->mkl_iterations; iter++) {
+        // Compute combined kernel matrix
+        double *combined_kernels = (double *) malloc(sizeof(double) * n * n);
+        for (i = 0; i < n * n; i++) {
+            combined_kernels[i] = gkm_weight * gkm_kernels[i] + rbf_weight * rbf_kernels[i];
+        }
+        
+        // Compute kernel alignment (simplified objective)
+        double yy_sum = 0.0, ky_sum = 0.0, kk_sum = 0.0;
+        for (i = 0; i < n; i++) {
+            for (j = 0; j < n; j++) {
+                double yy = prob->y[i] * prob->y[j];
+                double kk = combined_kernels[i * n + j];
+                yy_sum += yy * yy;
+                ky_sum += kk * yy;
+                kk_sum += kk * kk;
+            }
+        }
+        
+        double obj = ky_sum / sqrt(yy_sum * kk_sum);
+        
+        if (fabs(obj - prev_obj) < param->mkl_tolerance) {
+            clog_info(CLOG(LOGGER_ID), "MKL converged at iteration %d", iter);
+            break;
+        }
+        
+        // Simple gradient update (simplified)
+        double gkm_grad = 0.0, rbf_grad = 0.0;
+        for (i = 0; i < n; i++) {
+            for (j = 0; j < n; j++) {
+                double yy = prob->y[i] * prob->y[j];
+                gkm_grad += gkm_kernels[i * n + j] * yy;
+                rbf_grad += rbf_kernels[i * n + j] * yy;
+            }
+        }
+        
+        // Update weights
+        double alpha = 0.01; // learning rate
+        gkm_weight += alpha * gkm_grad / (n * n);
+        rbf_weight += alpha * rbf_grad / (n * n);
+        
+        // Project to simplex (ensure weights sum to 1)
+        double total = gkm_weight + rbf_weight;
+        if (total > 0) {
+            gkm_weight /= total;
+            rbf_weight /= total;
+        }
+        
+        // Ensure non-negative weights
+        gkm_weight = gkm_weight > 0 ? gkm_weight : 0.0;
+        rbf_weight = rbf_weight > 0 ? rbf_weight : 0.0;
+        
+        prev_obj = obj;
+        free(combined_kernels);
+        
+        if (iter % 10 == 0) {
+            clog_info(CLOG(LOGGER_ID), "MKL iter %d: obj=%.6f, gkm_weight=%.4f, rbf_weight=%.4f", 
+                      iter, obj, gkm_weight, rbf_weight);
+        }
+    }
+    
+    param->gkm_weight = gkm_weight;
+    param->rbf_weight = rbf_weight;
+    
+    clog_info(CLOG(LOGGER_ID), "MKL optimization finished: gkm_weight=%.4f, rbf_weight=%.4f", 
+              param->gkm_weight, param->rbf_weight);
+    
+    free(gkm_kernels);
+    free(rbf_kernels);
 }
 

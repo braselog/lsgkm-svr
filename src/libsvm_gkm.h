@@ -26,7 +26,7 @@
 
 #define MAX_ALPHABET_SIZE 4 /* base ACGT, DON'T CHANGE THIS PARAMETER! */
 #define MAX_ALPHABET_SIZE_SQ 16 // MAX_ALPHABET_SIZE*MAX_ALPHABET_SIZE
-#define MAX_SEQ_LENGTH 2048
+#define MAX_SEQ_LENGTH 5837
 #define MMCNT_LOOKUPTAB_WIDTH 8
 
 #ifdef __cplusplus 
@@ -88,6 +88,15 @@ void gkmkernel_destroy_sv();
 double* gkmkernel_kernelfunc_batch_sv(const gkm_data *d, double *res);
 double* gkmexplainkernel_kernelfunc_batch_sv(const gkm_data *d, double *res, double ***persv_explanation, int mode);
 double* gkmexplainsinglebasekernel_kernelfunc_batch_sv(const gkm_data *d, double *res, double **singlebasepersv_explanation);
+
+/* MKL functions */
+void gkmkernel_mkl_init(struct svm_parameter *param);
+void gkmkernel_mkl_destroy();
+double gkmkernel_mkl_kernelfunc(const gkm_data *da, const gkm_data *db);
+double* gkmkernel_mkl_kernelfunc_batch(const gkm_data *da, const union svm_data *db_array, const int n, double *res);
+double* gkmkernel_mkl_kernelfunc_batch_all(const int a, const int start, const int end, double *res);
+double* gkmkernel_mkl_kernelfunc_batch_sv(const gkm_data *d, double *res);
+void gkmkernel_mkl_optimize_weights(const struct svm_problem *prob, struct svm_parameter *param);
 
 void gkmkernel_init_predict(union svm_data *sv, double *alpha, int nclass, int n);
 double gkmkernel_predict(const gkm_data *d);

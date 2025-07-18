@@ -33,7 +33,7 @@ void print_usage_and_exit()
 {
     printf(
             "\n"
-            "Usage: gkmtrain [options] <file1> <file2> <outprefix>\n"
+            "Usage: gkmtrain [options] <file1> <file2> <outprefix> [covariates]\n"
             "\n"
             " train gkm-SVM using libSVM\n"
             "\n"
@@ -42,6 +42,7 @@ void print_usage_and_exit()
             " file2: if classification: negative sequence file (FASTA format). If regression: corresponding labels (one per line)\n"
             " outprefix: prefix of output file(s) <outprefix>.model.txt or\n"
             "            <outprefix>.cvpred.txt\n"
+            " covariates: optional tab-separated file with covariates (one row per sequence)\n"
             "\n"
             "Options:\n"
             " -y <0 ~ 4>   set svm type (default: 0 C_SVC)\n"
@@ -50,7 +51,7 @@ void print_usage_and_exit()
             "                2 -- ONE_CLASS (untested)\n"
             "                3 -- EPSILON_SVR\n"
             "                4 -- NU_SVR (untested)\n"
-            " -t <0 ~ 6>   set kernel function (default: 4 wgkm)\n"
+            " -t <0 ~ 9>   set kernel function (default: 4 wgkm)\n"
             "              NOTE: RBF kernels (3, 5 and 6) work best with -c 10 -g 2\n"
             "                0 -- gapped-kmer\n"
             "                1 -- estimated l-mer with full filter\n"
@@ -60,15 +61,24 @@ void print_usage_and_exit()
             "                     [weight = max(M, floor(M*exp(-ln(2)*D/H)+1))]\n"
             "                5 -- (truncated l-mer) gkm + center weighted + RBF (wgkmrbf)\n"
             "                6 -- gapped-kmer + RBF\n"
+            "                7 -- Multiple Kernel Learning: GKM + RBF on covariates\n"
+            "                8 -- Multiple Kernel Learning: GKM only (ignores covariates)\n"
+            "                9 -- Multiple Kernel Learning: RBF only on covariates\n"
             " -l <int>     set word length, 3<=l<=12 (default: 11)\n"
             " -k <int>     set number of informative column, k<=l (default: 7)\n"
             " -d <int>     set maximum number of mismatches to consider, d<=4 (default: 3)\n"
             " -g <float>   set gamma for RBF kernel. -t 3 or 5 or 6 only (default: 1.0)\n"
+            " -G <float>   set gamma for RBF kernel on covariates in MKL. -t 7 or 9 only (default: 1.0)\n"
             " -M <int>     set the initial value (M) of the exponential decay function\n"
             "              for wgkm-kernels. max=255, -t 4 or 5 only (default: 50)\n"
             " -H <float>   set the half-life parameter (H) that is the distance (D) required\n"
             "              to fall to half of its initial value in the exponential decay\n"
             "              function for wgkm-kernels. -t 4 or 5 only (default: 50)\n"
+            " -W <float>   set initial weight for GKM kernel in MKL. -t 7 only (default: 0.5)\n"
+            " -R <float>   set initial weight for RBF kernel in MKL. -t 7 only (default: 0.5)\n"
+            " -I <int>     set max iterations for MKL optimization (default: 100)\n"
+            " -E <float>   set convergence tolerance for MKL optimization (default: 1e-6)\n"
+            " -N           if set, normalize individual kernels in MKL before combining\n"
             " -c <float>   set the regularization parameter SVM-C (default: 1.0)\n"
             " -e <float>   set the precision parameter epsilon (default: 0.001)\n"
             " -p <float>   set the SVR epsilon (default: 0.1)\n"
@@ -94,6 +104,8 @@ void print_usage_and_exit()
 
 void read_problem_svc(const char *file1, const char *file2);
 void read_problem_svr(const char *file1, const char *file2);
+void read_problem_svc_with_covariates(const char *file1, const char *file2, const char *cov_file);
+void read_problem_svr_with_covariates(const char *file1, const char *file2, const char *cov_file);
 void do_cross_validation(const char *filename);
 
 static struct svm_parameter param;
@@ -137,6 +149,7 @@ int main(int argc, char** argv)
     int nthreads = 1;
 	int rseed = 1;
     int tmpM;
+    char *covariate_file = NULL;
 
     /* Initialize the logger */
     if (clog_init_fd(LOGGER_ID, 1) != 0) {
@@ -158,6 +171,12 @@ int main(int argc, char** argv)
     param.M = 50;
     param.H = 50;
     param.gamma = 1.0;
+    param.rbf_gamma = 1.0;
+    param.gkm_weight = 0.5;
+    param.rbf_weight = 0.5;
+    param.mkl_iterations = 100;
+    param.mkl_tolerance = 1e-6;
+    param.normalize_kernels = 0;
     param.cache_size = 100;
     param.C = 1;
     param.eps = 1e-3;
@@ -172,7 +191,7 @@ int main(int argc, char** argv)
     icv = 0;
 
 	int c;
-	while ((c = getopt (argc, argv, "y:t:l:k:d:g:M:H:c:e:p:w:m:x:i:r:sv:T:")) != -1) {
+	while ((c = getopt (argc, argv, "y:t:l:k:d:g:G:M:H:W:R:I:E:c:e:p:w:m:x:i:r:sv:T:N")) != -1) {
 		switch (c) {
             case 'y':
                 param.svm_type = atoi(optarg);
@@ -192,6 +211,9 @@ int main(int argc, char** argv)
             case 'g':
                 param.gamma = atof(optarg);
                 break;
+            case 'G':
+                param.rbf_gamma = atof(optarg);
+                break;
             case 'M':
                 tmpM = atoi(optarg);
                 if (tmpM > 255) {
@@ -202,6 +224,21 @@ int main(int argc, char** argv)
                 break;
             case 'H':
                 param.H = atof(optarg);
+                break;
+            case 'W':
+                param.gkm_weight = atof(optarg);
+                break;
+            case 'R':
+                param.rbf_weight = atof(optarg);
+                break;
+            case 'I':
+                param.mkl_iterations = atoi(optarg);
+                break;
+            case 'E':
+                param.mkl_tolerance = atof(optarg);
+                break;
+            case 'N':
+                param.normalize_kernels = 1;
                 break;
 			case 'c':
 				param.C = atof(optarg);
@@ -249,15 +286,18 @@ int main(int argc, char** argv)
 		}
 	}
 
-    if (argc - optind != 3) {
-        fprintf(stderr,"Wrong number of arguments [%d].\n", argc - optind);
+    if (argc - optind < 3 || argc - optind > 4) {
+        fprintf(stderr,"Wrong number of arguments [%d]. Expected 3 or 4.\n", argc - optind);
         print_usage_and_exit();
     }
 
 	int index = optind;
 	char *file1 = argv[index++];
 	char *file2 = argv[index++];
-	char *outprefix = argv[index];
+	char *outprefix = argv[index++];
+	if (argc - optind == 4) {
+        covariate_file = argv[index];
+    }
 
     switch(verbosity) 
     {
@@ -287,6 +327,9 @@ int main(int argc, char** argv)
     clog_info(CLOG(LOGGER_ID), "  file1 = %s", file1);
     clog_info(CLOG(LOGGER_ID), "  file2 = %s", file2);
     clog_info(CLOG(LOGGER_ID), "  outprefix = %s", outprefix);
+    if (covariate_file) {
+        clog_info(CLOG(LOGGER_ID), "  covariates = %s", covariate_file);
+    }
 
     clog_info(CLOG(LOGGER_ID), "Parameters:");
     clog_info(CLOG(LOGGER_ID), "  svm-type = %d", param.svm_type);
@@ -295,11 +338,17 @@ int main(int argc, char** argv)
     clog_info(CLOG(LOGGER_ID), "  k = %d", param.k);
     clog_info(CLOG(LOGGER_ID), "  d = %d", param.d);
     if (param.kernel_type == EST_TRUNC_RBF || param.kernel_type == GKM_RBF || param.kernel_type == EST_TRUNC_PW_RBF) {
-    clog_info(CLOG(LOGGER_ID), "  gamma = %g", param.gamma);
+        clog_info(CLOG(LOGGER_ID), "  gamma = %g", param.gamma);
     }
-    if (param.kernel_type == EST_TRUNC_PW || param.kernel_type == EST_TRUNC_PW_RBF) {
-    clog_info(CLOG(LOGGER_ID), "  M = %d", param.M);
-    clog_info(CLOG(LOGGER_ID), "  H = %g", param.H);
+    if (param.kernel_type == MKL_GKM_RBF || param.kernel_type == MKL_RBF_ONLY) {
+        clog_info(CLOG(LOGGER_ID), "  rbf_gamma = %g", param.rbf_gamma);
+    }
+    if (param.kernel_type == MKL_GKM_RBF) {
+        clog_info(CLOG(LOGGER_ID), "  gkm_weight = %g", param.gkm_weight);
+        clog_info(CLOG(LOGGER_ID), "  rbf_weight = %g", param.rbf_weight);
+        clog_info(CLOG(LOGGER_ID), "  mkl_iterations = %d", param.mkl_iterations);
+        clog_info(CLOG(LOGGER_ID), "  mkl_tolerance = %g", param.mkl_tolerance);
+        clog_info(CLOG(LOGGER_ID), "  normalize_kernels = %s", param.normalize_kernels ? "yes" : "no");
     }
     clog_info(CLOG(LOGGER_ID), "  C = %g", param.C);
     if (param.nr_weight == 1) {
@@ -328,9 +377,17 @@ int main(int argc, char** argv)
     max_line_len = 1024;
     line = (char *) malloc(sizeof(char) * ((size_t) max_line_len));
     if (param.svm_type == C_SVC || param.svm_type == NU_SVC) {
-        read_problem_svc(file1, file2);
+        if (covariate_file) {
+            read_problem_svc_with_covariates(file1, file2, covariate_file);
+        } else {
+            read_problem_svc(file1, file2);
+        }
     } else {
-        read_problem_svr(file1, file2);
+        if (covariate_file) {
+            read_problem_svr_with_covariates(file1, file2, covariate_file);
+        } else {
+            read_problem_svr(file1, file2);
+        }
     }
 
     error_msg = svm_check_parameter(&prob,&param);
@@ -372,7 +429,7 @@ void read_labels_regression(const char *filename)
     FILE *fp = fopen(filename,"r");
 
     if(fp == NULL) {
-        clog_error(CLOG(LOGGER_ID), "can't open file");
+        clog_error(CLOG(LOGGER_ID), "can't open labels file");
         exit(1);
     }
 
@@ -399,7 +456,7 @@ void read_fasta_file_regression(const char *filename)
     FILE *fp = fopen(filename,"r");
 
     if(fp == NULL) {
-        clog_error(CLOG(LOGGER_ID), "can't open file");
+        clog_error(CLOG(LOGGER_ID), "can't open fasta file - regression");
         exit(1);
     }
 
@@ -458,7 +515,7 @@ void read_fasta_file_classification(const char *filename, int offset, int label)
     FILE *fp = fopen(filename,"r");
 
     if(fp == NULL) {
-        clog_error(CLOG(LOGGER_ID), "can't open file");
+        clog_error(CLOG(LOGGER_ID), "can't open fasta file - classification");
         exit(1);
     }
 
@@ -519,7 +576,7 @@ int count_sequences(const char *filename)
     int nseqs = 0;
 
     if(fp == NULL) {
-        clog_error(CLOG(LOGGER_ID), "can't open file");
+        clog_error(CLOG(LOGGER_ID), "can't open file - count sequences");
         exit(1);
     }
 
@@ -570,4 +627,100 @@ void do_cross_validation(const char *filename)
 
     //TODO: calculate AUC here
     free(target);
+}
+
+void read_covariates(const char *filename, int start_index, int num_sequences)
+{
+    FILE *fp = fopen(filename, "r");
+    if (fp == NULL) {
+        clog_error(CLOG(LOGGER_ID), "can't open covariate file %s", filename);
+        exit(1);
+    }
+
+    clog_info(CLOG(LOGGER_ID), "reading covariates from %s", filename);
+
+    int seq_idx = 0;
+    int first_line = 1;
+    int num_covariates = 0;
+    
+    while (readline(fp) && seq_idx < num_sequences) {
+        if (seq_idx + start_index >= prob.l) {
+            clog_error(CLOG(LOGGER_ID), "error: covariate file has more rows than sequences");
+            exit(1);
+        }
+        
+        // Count number of covariates from first line
+        if (first_line) {
+            char *line_copy = strdup(line);
+            char *token = strtok(line_copy, "\t");
+            while (token != NULL) {
+                num_covariates++;
+                token = strtok(NULL, "\t");
+            }
+            free(line_copy);
+            first_line = 0;
+            clog_info(CLOG(LOGGER_ID), "found %d covariates", num_covariates);
+        }
+        
+        // Allocate memory for covariates if not already done
+        if (prob.x[start_index + seq_idx].d->covariates == NULL) {
+            prob.x[start_index + seq_idx].d->covariates = (double *) malloc(sizeof(double) * num_covariates);
+            prob.x[start_index + seq_idx].d->num_covariates = num_covariates;
+        }
+        
+        // Parse covariates from current line
+        char *token = strtok(line, "\t");
+        int cov_idx = 0;
+        while (token != NULL && cov_idx < num_covariates) {
+            prob.x[start_index + seq_idx].d->covariates[cov_idx] = atof(token);
+            token = strtok(NULL, "\t");
+            cov_idx++;
+        }
+        
+        if (cov_idx != num_covariates) {
+            clog_error(CLOG(LOGGER_ID), "error: inconsistent number of covariates at line %d", seq_idx + 1);
+            exit(1);
+        }
+        
+        seq_idx++;
+    }
+    
+    if (seq_idx != num_sequences) {
+        clog_error(CLOG(LOGGER_ID), "error: covariate file has %d rows but expected %d", seq_idx, num_sequences);
+        exit(1);
+    }
+    
+    fclose(fp);
+    clog_info(CLOG(LOGGER_ID), "done reading covariates");
+}
+
+void read_problem_svc_with_covariates(const char *file1, const char *file2, const char *cov_file)
+{
+    int n1 = count_sequences(file1);
+    int n2 = count_sequences(file2);
+    prob.l = n1 + n2;
+
+    prob.y = (double *) malloc(sizeof(double) * ((size_t) prob.l));
+    prob.x = (union svm_data *) malloc(sizeof(union svm_data) * ((size_t) prob.l));
+
+    clog_info(CLOG(LOGGER_ID), "reading %d sequences from %s", n1, file1);
+    read_fasta_file_classification(file1, 0, 1);
+
+    clog_info(CLOG(LOGGER_ID), "reading %d sequences from %s", n2, file2);
+    read_fasta_file_classification(file2, n1, -1);
+
+    read_covariates(cov_file, 0, prob.l);
+}
+
+void read_problem_svr_with_covariates(const char *file1, const char *file2, const char *cov_file)
+{
+    int n1 = count_sequences(file1);
+    prob.l = n1;
+
+    prob.y = (double *) malloc(sizeof(double) * ((size_t) prob.l));
+    prob.x = (union svm_data *) malloc(sizeof(union svm_data) * ((size_t) prob.l));
+
+    read_fasta_file_regression(file1);
+    read_labels_regression(file2);
+    read_covariates(cov_file, 0, prob.l);
 }
