@@ -30,7 +30,9 @@
 extern "C" {
 #endif
 
+#ifdef USE_CUDA
 #include "rbf_cuda.h"
+#endif
 
 #ifdef __cplusplus
 }
@@ -419,6 +421,7 @@ int main(int argc, char** argv)
     gkmkernel_init(&param);
 
     // GPU memory management and diagnostics
+#ifdef USE_CUDA
     if (gpu_reserve_mb > 0) {
         extern cuda_context_t g_cuda_context;
         if (g_cuda_context.is_initialized) {
@@ -457,6 +460,19 @@ int main(int argc, char** argv)
             clog_warn(CLOG(LOGGER_ID), "GPU not initialized - cannot perform auto-tuning");
         }
     }
+#else
+    if (gpu_reserve_mb > 0) {
+        clog_warn(CLOG(LOGGER_ID), "GPU memory reservation requested but CUDA support not available");
+    }
+    
+    if (gpu_diagnostics) {
+        clog_warn(CLOG(LOGGER_ID), "GPU diagnostics requested but CUDA support not available");
+    }
+    
+    if (gpu_auto_tune) {
+        clog_warn(CLOG(LOGGER_ID), "GPU auto-tuning requested but CUDA support not available");
+    }
+#endif
 
     max_line_len = 1024;
     line = (char *) malloc(sizeof(char) * ((size_t) max_line_len));

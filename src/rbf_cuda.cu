@@ -170,7 +170,12 @@ extern "C" void cuda_print_device_info(void) {
 // Get available GPU memory with detailed information
 extern "C" size_t cuda_get_detailed_memory_info(size_t *free_mem, size_t *total_mem) {
     cudaError_t err = cudaMemGetInfo(free_mem, total_mem);
-    return (err == cudaSuccess) ? *free_mem : 0;
+    if (err != cudaSuccess) {
+        if (free_mem) *free_mem = 0;
+        if (total_mem) *total_mem = 0;
+        return 0;
+    }
+    return *free_mem;
 }
 
 // Get available GPU memory
@@ -181,10 +186,11 @@ extern "C" size_t cuda_get_available_memory(void) {
 
 // Update real-time memory information in context
 extern "C" int cuda_update_memory_info(cuda_context_t *ctx) {
-    if (!ctx || !ctx->is_initialized) return -1;
+    if (!ctx) return -1;
     
     size_t free_mem, total_mem;
-    if (cuda_get_detailed_memory_info(&free_mem, &total_mem) == 0) {
+    size_t result = cuda_get_detailed_memory_info(&free_mem, &total_mem);
+    if (result == 0) {
         return -1;
     }
     
@@ -448,6 +454,9 @@ extern "C" int cuda_init_context(cuda_context_t *ctx, int max_batch_size, int ma
     CUDA_CHECK(cudaSetDevice(0));
     ctx->device_id = 0;
     
+    // Mark as initialized early so memory functions work
+    ctx->is_initialized = 1;
+    
     // Initialize memory monitoring
     ctx->memory_monitoring_enabled = 1;
     ctx->adaptive_enabled = 1;
@@ -502,8 +511,6 @@ extern "C" int cuda_init_context(cuda_context_t *ctx, int max_batch_size, int ma
     
     // Initialize batch optimization
     cuda_enable_adaptive_sizing(ctx, 1);
-    
-    ctx->is_initialized = 1;
     
     printf("CUDA context initialized:\n");
     printf("  Max batch size: %d\n", max_batch_size);
@@ -561,12 +568,17 @@ static void float_to_double_array(const float *src, double *dst, int n) {
 
 // Main CUDA RBF kernel batch computation
 extern "C" int cuda_rbf_kernel_batch(cuda_context_t *ctx,
-                                    const struct gkm_data *da,
-                                    const struct gkm_data **db_array,
+                                    const gkm_data *da,
+                                    const gkm_data **db_array,
                                     int n, double gamma, double *results, int normalize) {
     if (!ctx || !ctx->is_initialized || !da || !db_array || !results || n <= 0) {
         return -1;
     }
+    
+    // Declare variables at the beginning to avoid goto initialization issues
+    int block_size = CUDA_BLOCK_SIZE;
+    int grid_size;
+    double execution_time = 0.0;
     
     // Record start time for performance monitoring
     struct timespec start_time, end_time;
@@ -656,8 +668,7 @@ extern "C" int cuda_rbf_kernel_batch(cuda_context_t *ctx,
                          n * num_covariates * sizeof(float), cudaMemcpyHostToDevice));
     
     // Configure kernel launch parameters
-    int block_size = CUDA_BLOCK_SIZE;
-    int grid_size = (n + block_size - 1) / block_size;
+    grid_size = (n + block_size - 1) / block_size;
     if (grid_size > CUDA_MAX_BLOCKS) grid_size = CUDA_MAX_BLOCKS;
     
     if (normalize) {
@@ -702,8 +713,8 @@ extern "C" int cuda_rbf_kernel_batch(cuda_context_t *ctx,
     
     // Calculate execution time
     clock_gettime(CLOCK_MONOTONIC, &end_time);
-    double execution_time = (end_time.tv_sec - start_time.tv_sec) + 
-                           (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
+    execution_time = (end_time.tv_sec - start_time.tv_sec) + 
+                     (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
     
     // Record performance for optimization
     cuda_record_batch_performance(ctx, n, execution_time, 1);

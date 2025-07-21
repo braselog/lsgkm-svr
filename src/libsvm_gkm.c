@@ -44,7 +44,7 @@
 #ifdef USE_CUDA
 #include "rbf_cuda.h"
 // Global CUDA variables
-static cuda_context_t g_cuda_context = {0};
+cuda_context_t g_cuda_context = {0};
 static int g_cuda_enabled = 0;
 static int g_cuda_min_batch_size = CUDA_MIN_BATCH_SIZE;
 #endif

@@ -5,8 +5,8 @@
 extern "C" {
 #endif
 
-// Forward declaration of gkm_data structure
-struct gkm_data;
+// Forward declaration of gkm_data typedef
+typedef struct _gkm_data gkm_data;
 
 // CUDA configuration
 #define CUDA_BLOCK_SIZE 256
@@ -65,8 +65,8 @@ void cuda_cleanup_context(cuda_context_t *ctx);
 
 // RBF kernel computation functions
 int cuda_rbf_kernel_batch(cuda_context_t *ctx, 
-                         const struct gkm_data *da, 
-                         const struct gkm_data **db_array,
+                         const gkm_data *da, 
+                         const gkm_data **db_array,
                          int n, double gamma, double *results, int normalize);
 
 // Enhanced memory management and optimization
